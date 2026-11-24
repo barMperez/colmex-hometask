@@ -24,7 +24,7 @@
 - [x] 3.3 Set up Alembic with a schema revision that works on both dialects. Verify: `alembic upgrade head` then `alembic downgrade base` succeeds on SQLite.
 - [x] 3.4 Add seed data migrations: the 3 enabled pairs (USD, EUR, GBP → ILS), policy v1 (45 min grace, 7-day cap, 15:15/12:15, Asia/Jerusalem), the 2026 and 2027 BoI non-publication dates (origin `BOI_CALENDAR`), and `calendar_coverage` rows for 2026 and 2027. Verify: an integration test after upgrade counts 3 pairs, 1 active policy, 16 + 13 non-publication days and 2 coverage years.
 - [x] 3.5 Implement repository interfaces and SQLAlchemy implementations (pairs, rates with `latest_for_pair` ordering and idempotent `insert_many`, calendar view loader, active policy, audit). Insert-or-ignore is chosen by dialect. Verify: integration tests for latest-observation ordering (including same-day correction), duplicate insert ignored, and an empty active policy returning none.
-- [ ] 3.6 Make the integration suite run on Postgres when `TEST_DATABASE_URL` is set. Verify: the suite passes on SQLite, and on Postgres against `docker compose up postgres`.
+- [x] 3.6 Make the integration suite run on Postgres when `TEST_DATABASE_URL` is set. Verify: the suite passes on SQLite, and on Postgres against `docker compose up postgres`.
 
 ## 4. Operator script
 
@@ -39,7 +39,7 @@
 - [x] 5.3 Implement `parser.py` and snapshot validation (all enabled pairs present, rate > 0, unit a positive integer, consistent `lastUpdate`, publication date not after today in Israel, unknown currencies ignored), plus unit normalisation and publication-date derivation. Verify: unit tests for every validation and normalisation scenario in `specs/rate-ingestion/spec.md`, including JPY 2.1026/100 → 0.021026 and 22:30Z → next Israel date.
 - [x] 5.4 Implement `services/ingestion.py`: validate the snapshot, then in one transaction insert observations and write a `RATES_INGESTED` audit event only if rows were inserted. Verify: integration tests for the idempotent re-ingest, no audit on duplicate, rollback on mid-write failure, and same-day correction kept.
 - [x] 5.5 Implement `refresh/loop.py` and `__main__.py`: an asyncio loop with window and off-window intervals based on the business calendar and the injected clock, logging each attempt's outcome and the last success time, and continuing after failures. Verify: unit tests with `FixedClock` for interval selection, and an integration test showing a failed fetch leaves stored observations unchanged.
-- [ ] 5.6 Add the decimal round-trip test: ingest the fixture `3.343` and read it back from the DB as exactly `Decimal("3.343")`. Verify: the test passes on SQLite and Postgres.
+- [x] 5.6 Add the decimal round-trip test: ingest the fixture `3.343` and read it back from the DB as exactly `Decimal("3.343")`. Verify: the test passes on SQLite and Postgres.
 
 ## 6. HTTP API
 
@@ -52,15 +52,15 @@
 
 ## 7. Docker Compose with Postgres
 
-- [ ] 7.1 Write a `Dockerfile` (python:3.12-slim, non-root user, installs the package; one image for api, refresh and migrate). Verify: `docker build .` succeeds.
-- [ ] 7.2 Write `docker-compose.yml` with services `postgres` (healthcheck, named volume), `migrate` (`alembic upgrade head`), `api` (:8000) and `refresh` (1 replica), using `depends_on` conditions per D12. Verify: `docker compose up` brings the API to healthy and `curl localhost:8000/health/ready` returns 200.
-- [ ] 7.3 Write README §7: running without Docker (SQLite), running tests on SQLite and Postgres, simulating BoI failure (point the BoI URL at an unreachable host), and the `docker compose run` operator command. Verify: each documented command runs as written.
+- [x] 7.1 Write a `Dockerfile` (python:3.12-slim, non-root user, installs the package; one image for api, refresh and migrate). Verify: `docker build .` succeeds.
+- [x] 7.2 Write `docker-compose.yml` with services `postgres` (healthcheck, named volume), `migrate` (`alembic upgrade head`), `api` (:8000) and `refresh` (1 replica), using `depends_on` conditions per D12. Verify: `docker compose up` brings the API to healthy and `curl localhost:8000/health/ready` returns 200.
+- [x] 7.3 Write README §7: running without Docker (SQLite), running tests on SQLite and Postgres, simulating BoI failure (point the BoI URL at an unreachable host), and the `docker compose run` operator command. Verify: each documented command runs as written.
 
 ## 8. End-to-end checks and README completion
 
-- [ ] 8.1 End-to-end smoke test on compose: after `docker compose up`, the refresh process ingests real BoI data and `GET /api/v1/exchange-rates?base=USD&quote=ILS` returns 200 with an `eligibility` block. Verify: a manual run, with the output captured in the README.
-- [ ] 8.2 Complete README §5 (decisions and trade-offs table D1–D13, including the 503 → 200 + NOT_ELIGIBLE change), §6 (assumptions and limitations), §8 (out of scope and extensions) and §9 (AI-assistance note). Verify: every design decision and risk in `design.md` appears in the README.
-- [ ] 8.3 Run the full test suite on SQLite and on Postgres, and run `openspec validate add-exchange-rates-api --strict`. Verify: all green.
+- [x] 8.1 End-to-end smoke test on compose: after `docker compose up`, the refresh process ingests real BoI data and `GET /api/v1/exchange-rates?base=USD&quote=ILS` returns 200 with an `eligibility` block. Verify: a manual run, with the output captured in the README.
+- [x] 8.2 Complete README §5 (decisions and trade-offs table D1–D13, including the 503 → 200 + NOT_ELIGIBLE change), §6 (assumptions and limitations), §8 (out of scope and extensions) and §9 (AI-assistance note). Verify: every design decision and risk in `design.md` appears in the README.
+- [x] 8.3 Run the full test suite on SQLite and on Postgres, and run `openspec validate add-exchange-rates-api --strict`. Verify: all green.
 
 ## Workflow follow-up
 

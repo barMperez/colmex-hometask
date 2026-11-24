@@ -214,6 +214,8 @@ The full design record, including the alternatives considered, is in [`openspec/
 - **The BoI calendar must be loaded every year.** Seeded for 2026–2027 from BoI's official PDF. From 2028-01-01 the API returns `503 POLICY_NOT_EVALUABLE` (by design) until a migration adds the 2028 list and a `calendar_coverage` row. Walking back from early January also needs the previous year.
 - **Holiday eves with an early (12:15) publication are not modelled.** The calendar only lists days with *no* publication. On a Mon–Thu holiday eve the previous rate stays eligible until 16:00 instead of 13:00. The refresh process still ingests the new rate as soon as it appears.
 - **Ingestion lag.** Between BoI publishing and our next poll (≤ 5 min in the window) the API serves the previous rate, which is still eligible until the deadline.
+- **BoI may change its payload shape.** Whole-snapshot validation rejects anything unexpected, the last good data is kept, and the failure is logged. Reads turn `NOT_ELIGIBLE` after the next deadline, which is the visible signal.
+- **SQLite allows one writer.** That matches the design (only the refresh process writes) and WAL keeps readers concurrent. Postgres is the compose default.
 - **`publicationDate` is derived** from BoI's `lastUpdate` timestamp converted to Israel time. The API has no explicit date field.
 - **Representative rates are not trade prices** (see §1).
 - **No stated load or SLO requirements** were given. Reads are a few indexed queries over a tiny dataset; the API scales horizontally (`API_WORKERS`, more replicas). The refresh process must stay single-instance (correctness doesn't depend on it, efficiency does).
@@ -240,10 +242,11 @@ Configuration is via environment variables or a `.env` file. See [`.env.example`
 ```bash
 pytest                                                                   # SQLite (default)
 docker compose up -d postgres
-TEST_DATABASE_URL=postgresql+asyncpg://rates:rates@localhost:5433/rates pytest   # same suite on Postgres
+docker compose exec postgres createdb -U rates rates_test                       # once per volume
+TEST_DATABASE_URL=postgresql+asyncpg://rates:rates@localhost:5433/rates_test pytest   # same suite on Postgres
 ```
 
-On PowerShell: `$env:TEST_DATABASE_URL="postgresql+asyncpg://rates:rates@localhost:5433/rates"; pytest`. The suite resets the schema on that database.
+On PowerShell: `$env:TEST_DATABASE_URL="postgresql+asyncpg://rates:rates@localhost:5433/rates_test"; pytest`. The suite drops and recreates the `public` schema before every test, so use a dedicated database: pointing it at `rates` would wipe the running stack's data.
 
 - `tests/unit`: eligibility table (every spec scenario), calendar and DST, BoI parser and client (retries, malformed bodies), response serialisation.
 - `tests/integration`: decimal and timestamp round trips, migrations and seeds, repositories, ingestion atomicity and idempotency, refresh loop resilience, operator script.
@@ -259,6 +262,23 @@ BOI_URL=http://127.0.0.1:9/unreachable python -m rates.refresh
 With compose: `docker compose stop refresh`, then `docker compose run --rm -e BOI_URL=http://127.0.0.1:9/x refresh`. Existing data is untouched. Reads keep returning the stored rate, which becomes `NOT_ELIGIBLE` once the next deadline passes.
 
 **Operator script**: see §4.
+
+**End-to-end smoke run** (`docker compose up --build`, Tue 2026-11-24 13:45 Israel time, live BoI):
+
+```text
+refresh-1 | refresh.attempt outcome=success inserted=3 publication_date=2026-11-23 source_last_update=2026-11-23T13:21:10.710489+00:00 duration_ms=194
+
+$ curl localhost:8000/health/ready
+{"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T11:45:58.922261Z"}
+
+$ curl "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"
+{"rateId":"c2726261-6e4f-4692-8c33-b039a7f8b13b","baseCurrency":"USD","quoteCurrency":"ILS","rate":"3.343","publicationDate":"2026-11-23","eligibility":{"status":"ELIGIBLE","reason":null,"requiredPublicationDate":"2026-11-23","evaluatedAt":"2026-11-24T11:46:06.203451Z","policyVersion":1},"source":{"name":"BANK_OF_ISRAEL","type":"REPRESENTATIVE","lastUpdate":"2026-11-23T13:21:10.710489Z","rate":"3.343","unit":1},"retrievedAt":"2026-11-24T11:45:58.922261Z"}
+
+$ curl "localhost:8000/api/v1/exchange-rates?base=ILS&quote=USD"     # 422 UNSUPPORTED_CURRENCY_PAIR
+$ curl "localhost:8000/api/v1/exchange-rates?base=US1&quote=ILS"     # 400 INVALID_REQUEST
+```
+
+With the refresh process pointed at an unreachable BoI URL, the log shows `outcome=boi_unavailable` and the read above returns the same `rateId`, still `ELIGIBLE`.
 
 ## 8. Out of scope and possible extensions
 
