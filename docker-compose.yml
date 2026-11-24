@@ -45,6 +45,12 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       API_WORKERS: "2"
+      # DEMO-ONLY credentials: one demo user and a shared token-signing secret.
+      # Inject real values from a secret store for anything but a demo.
+      JWT_SECRET: demo-only-jwt-secret-do-not-use-in-prod-0123456
+      JWT_TTL_SECONDS: "3600"
+      DEMO_USERNAME: demo
+      DEMO_PASSWORD: demo-password
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:

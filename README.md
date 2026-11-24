@@ -21,11 +21,17 @@ Requires Docker. Starts Postgres, runs migrations and seeds, then the API and th
 docker compose up --build
 ```
 
+Rate reads need a bearer token. Compose ships a **demo-only** user (`demo` / `demo-password`):
+
 ```bash
-curl "http://localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"
-curl "http://localhost:8000/health/ready"
-open http://localhost:8000/docs        # OpenAPI / Swagger UI
+TOKEN=$(curl -s -d username=demo -d password=demo-password   http://localhost:8000/api/v1/auth/token | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"
+curl "http://localhost:8000/health/ready"      # no token needed
+open http://localhost:8000/docs                # Swagger UI: "Authorize" with demo / demo-password
 ```
+
+The token lasts an hour (`expires_in: 3600`). Without one, reads return **401** `AUTHENTICATION_REQUIRED`; with an expired or tampered one, 401 `INVALID_TOKEN`. Every authenticated read is written to the audit trail (§7).
 
 Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes are case-insensitive.
 
@@ -110,10 +116,11 @@ Which rounding applies is the consuming system's money rule, which is why this s
 ## 3. Architecture
 
 ```
-            +---------------------- API process (N workers, read-only) --------------------+
- HTTP --->  |  routes --> RateQueryService --> repositories --> DB                          |
-            |                   |                                                          |
-            |                   +--> evaluate(observation, now, calendar, policy)  [pure]  |
+            +------------- API process (N workers; writes audit rows only, never rates) ---+
+ HTTP --->  |  JWT check (401) --> routes --> RateQueryService --> repositories --> DB     |
+            |                         |               |                                    |
+            |                         |               +--> evaluate(...)  [pure]           |
+            |                         +--> QueryAuditService --> audit_events (RATE_QUERIED) |
             +------------------------------------------------------------------------------+
 
             +---------------------- refresh process (exactly 1, only writer) --------------+
@@ -130,7 +137,7 @@ Which rounding applies is the consuming system's money rule, which is why this s
                       +-- scripts/declare_non_publication_day.py (day + audit, one transaction)
 ```
 
-**Read flow** (`GET /api/v1/exchange-rates`): validate codes (400), then check the pair is enabled (422), then load the active policy and calendar (503 if missing), then load the latest observation (404 if none), then `evaluate(...)` and return 200. **BoI is never called on the read path**, so BoI outages don't affect reads; they only stop new data arriving.
+**Read flow** (`GET /api/v1/exchange-rates`): verify the bearer token (401, not audited), validate codes (400), then check the pair is enabled (422), then load the active policy and calendar (503 if missing), then load the latest observation (404 if none), then `evaluate(...)`, write the `RATE_QUERIED` audit record and only then return 200 (503 `AUDIT_UNAVAILABLE` if the record can't be stored). Rejected authenticated reads are audited too. **BoI is never called on the read path**, so BoI outages don't affect reads; they only stop new data arriving.
 
 **Refresh flow**: every **1 min** on business days from the expected publication time until 30 min after the deadline (15:15–16:30 Mon–Thu, 12:15–13:30 Fri, taken from the active policy), every 5 min otherwise between 12:00 and 18:00, and hourly outside that window, at weekends and on holidays. The dense window costs about 60 extra BoI requests per business day (75 polls instead of 15), and it means a late BoI publication reaches us within a minute instead of up to five. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates **each enabled currency on its own**: present, rate > 0, unit is a positive integer, a parseable `lastUpdate`, and no publication date in the future. A missing or invalid currency is rejected with its reason and logged at error level, while the valid currencies are still stored, so a GBP problem never stops USD. Such an attempt is recorded as `partial`, which doesn't count as a success. Only a payload without an `exchangeRates` array is rejected as a whole. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. The accepted currencies are inserted in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and one audit event is written only if anything new was stored; it lists any rejected currencies. A failed fetch changes nothing.
 
@@ -214,7 +221,7 @@ The full design record, including the alternatives considered, is in [`openspec/
 | 3 | **Eligibility = "at least as recent as the latest *expected* BoI publication"**, driven by BoI's calendar, instead of a max age in hours | Handles weekends, holidays and intraday timing with one rule. An hours-based TTL is wrong on Mondays and after holidays | Needs the official holiday list loaded each year (fails closed if missing) |
 | 4 | **Unexpected missed publication: fail closed until an operator declares it** (audited script) | Only a human can tell "BoI skipped a day" from "our ingestion is broken" | Requires a person to act; until then reads are `NOT_ELIGIBLE` |
 | 5 | **Pure `evaluate()` function** with an injected clock | All financial logic is unit-testable as a table; no I/O, no hidden `now()` | n/a |
-| 6 | **Two processes from one codebase**: API (N workers, read-only) + refresh (exactly 1 writer) | One writer by construction, no distributed locking; BoI latency never sits on the read path | Two things to run (one `docker compose up`) |
+| 6 | **Two processes from one codebase**: API (N workers, writes audit rows only) + refresh (exactly 1 writer of rate data) | One writer by construction, no distributed locking; BoI latency never sits on the read path | Two things to run (one `docker compose up`) |
 | 7 | **Append-only observations, idempotent on `(pair, BoI lastUpdate)`** | Same-day BoI corrections are kept as history; duplicate or concurrent refreshes are harmless | Storage grows slowly (3 rows per publication) |
 | 8 | **Per-currency validation** (replaced whole-snapshot validation) | Each pair's eligibility is judged on its own publication date, so a bad GBP entry has no reason to block USD deposits | A currency BoI stops sending leaves every attempt `partial`: `lastSuccessfulIngestionAt` freezes until the pair is disabled. That's intentional, so the problem gets alerted on |
 | 9 | **Exact decimals end to end**: `parse_float=Decimal`, `TEXT`/`NUMERIC` storage, JSON strings | Binary floats can't represent rates exactly | Consumers parse a string, not a JSON number |
@@ -222,6 +229,8 @@ The full design record, including the alternatives considered, is in [`openspec/
 | 11 | **Policy and calendar read on every request**, no cache | A few dozen rows; operator changes apply immediately; nothing to invalidate across workers | A few extra cheap queries per request |
 | 12 | **GET with query params**, single pair | Read-only, cacheable semantics | Batch lookups would need a new endpoint |
 | 13 | **Python 3.12 + FastAPI + Pydantic v2** | Async, OpenAPI from types, `Decimal` serialises as string | Weaker static guarantees than e.g. .NET; covered by tests |
+| 14 | **Demo JWT auth** (one configured user, HS256, expiry checked against the injected clock) | Every rate needs an owner, and a demo needs no identity provider; one clock keeps expiry testable | Not production identity (see §6, §8) |
+| 15 | **Fail closed on audit**: a rate is returned only after its `RATE_QUERIED` record commits | A rate handed out with no trace of who received it, and what they were told, breaks the audit trail | One insert per read; an audit outage blocks reads (in practice only when the DB is down anyway) |
 
 ## 6. Assumptions and limitations
 
@@ -234,7 +243,7 @@ The full design record, including the alternatives considered, is in [`openspec/
 - **`publicationDate` is derived** from BoI's `lastUpdate` timestamp converted to Israel time. The API has no explicit date field.
 - **Representative rates are not trade prices** (see §1).
 - **No stated load or SLO requirements** were given. Reads are a few indexed queries over a tiny dataset; the API scales horizontally (`API_WORKERS`, more replicas). The refresh process must stay single-instance (correctness doesn't depend on it, efficiency does).
-- **Security:** assumed internal network use. There is no authentication on the read API. The operator action is a script with DB access, not an HTTP endpoint. Compose credentials are for local development only.
+- **Security (demo only).** One configured user exchanges a username and password for an HS256 JWT (1 h, shared `JWT_SECRET`; the API refuses to start without a secret of at least 32 characters). There is no user store, no password hashing, no refresh token, no revocation (rotating `JWT_SECRET` invalidates every token) and no rate limiting. The Compose secret and password are demo values and must come from a secret store anywhere else. The operator action is a script with DB access, not an HTTP endpoint. Compose database credentials are for local development only.
 - **Health:** `/health/live` checks the process. `/health/ready` checks the database (200, or 503 `STORAGE_UNAVAILABLE`) and reports what an operator needs to keep deposits flowing:
   - `latestRetrievedAt`: when the newest stored rate was fetched.
   - `lastSuccessfulIngestionAt`: when the refresh process last completed a successful poll, including polls that found nothing new. Null until the first success. A `partial` poll (some currency rejected) does not count.
@@ -309,6 +318,18 @@ With compose: `docker compose stop refresh`, then `docker compose run --rm -e BO
 
 **Operator script**: see §4.
 
+**Audit trail of rate queries.** Each authenticated read leaves one `RATE_QUERIED` row in `audit_events`: the user (`actor`), `base`/`quote` exactly as sent, the HTTP status and error code, and, for a returned rate, its `rateId`, rate, `publicationDate` and the full eligibility verdict the caller received. 401s are not audited (there is no user); they're logged as `auth.rejected`. With compose:
+
+```bash
+docker compose exec postgres psql -U rates -d rates -c "
+  SELECT occurred_at, actor,
+         after->'request'->>'base' AS base, after->'request'->>'quote' AS quote,
+         after->'response'->>'status' AS status, after->'response'->>'code' AS code,
+         after->'response'->>'rateId' AS rate_id,
+         after->'response'->'eligibility'->>'status' AS eligibility
+  FROM audit_events WHERE event_type = 'RATE_QUERIED' ORDER BY occurred_at DESC LIMIT 10"
+```
+
 **End-to-end smoke run** (`docker compose up --build`, Tue 2026-11-24 13:45 Israel time, live BoI):
 
 ```text
@@ -355,6 +376,29 @@ $ curl "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"   # rate 3.345,
 # Docker restarts it (RestartCount 1) and the read above returns 200 again with no manual action
 ```
 
+**Authentication and audit** (Tue 24/11 16:36 Israel time, demo user):
+
+```text
+$ TOKEN=$(curl -s -d username=demo -d password=demo-password localhost:8000/api/v1/auth/token | python -c "...['access_token']")
+
+$ curl -H "Authorization: Bearer $TOKEN" "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"   # 200
+{"rateId":"fa99b236-de6e-42d6-b723-e0af9677497c","baseCurrency":"USD","quoteCurrency":"ILS","rate":"3.345","publicationDate":"2026-11-24","eligibility":{"status":"ELIGIBLE",...}, ...}
+
+$ curl "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"                                     # 401, no token
+{"type":"/problems/authentication-required","title":"Unauthorized","status":401,"detail":"A bearer token is required","code":"AUTHENTICATION_REQUIRED"}
+
+$ curl -H "Authorization: Bearer $TOKEN" "localhost:8000/api/v1/exchange-rates?base=ILS&quote=USD"   # 422
+{"type":"/problems/unsupported-currency-pair",...,"status":422,...,"code":"UNSUPPORTED_CURRENCY_PAIR"}
+
+$ docker compose exec postgres psql ... RATE_QUERIED rows since the first call:
+ actor | base | quote | status |           code            |               rate_id                | eligibility
+-------+------+-------+--------+---------------------------+--------------------------------------+-------------
+ demo  | USD  | ILS   | 200    |                           | fa99b236-de6e-42d6-b723-e0af9677497c | ELIGIBLE
+ demo  | ILS  | USD   | 422    | UNSUPPORTED_CURRENCY_PAIR |                                      |
+
+api-1 | auth.rejected code=AUTHENTICATION_REQUIRED path=/api/v1/exchange-rates ...   # the 401: logged, not audited
+```
+
 ## 8. Out of scope and possible extensions
 
 Out of scope by design: trade execution, rate locking and quote confirmation (the consumer's quoting service owns those; `rateId` lets it reference the exact observation), inverse and cross pairs, an admin HTTP API or UI, caching, and multi-region deployment.
@@ -365,6 +409,8 @@ Natural extensions:
 - Automated import or alerting for the next year's BoI calendar.
 - Metrics (Prometheus): last successful ingestion, observation age, eligible vs. not-eligible reads.
 - `GET /api/v1/exchange-rates/history` over the append-only observations.
+- Production identity: an identity provider (OIDC) or a user store with hashed passwords, roles, short tokens with refresh, revocation, and audited logins.
+- Audit retention and export: `RATE_QUERIED` rows grow by about one per read, with no retention policy yet.
 
 ## 9. AI assistance
 

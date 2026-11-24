@@ -6,7 +6,7 @@ they live in the versioned ``policies`` table so that changes are auditable.
 
 from datetime import time
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,3 +35,28 @@ class Settings(BaseSettings):
     api_workers: int = Field(default=1, ge=1)
 
     log_level: str = "INFO"
+
+    # Demo authentication (API process only). Values for the demo user are plain
+    # configuration: there is no user store and no password hashing.
+    jwt_secret: SecretStr | None = None
+    """HS256 signing secret shared by all API workers; at least 32 characters."""
+    jwt_ttl_seconds: int = Field(default=3600, ge=60)
+    demo_username: str = "demo"
+    demo_password: SecretStr | None = None
+
+
+MIN_JWT_SECRET_LENGTH = 32
+
+
+def require_api_settings(settings: "Settings") -> None:
+    """Fail fast when the API process lacks its authentication settings.
+
+    The refresh process does not authenticate anyone and never calls this.
+    """
+    secret = settings.jwt_secret.get_secret_value() if settings.jwt_secret else ""
+    if not secret:
+        raise RuntimeError("JWT_SECRET is not set: the API needs a token-signing secret")
+    if len(secret) < MIN_JWT_SECRET_LENGTH:
+        raise RuntimeError(f"JWT_SECRET must be at least {MIN_JWT_SECRET_LENGTH} characters")
+    if not settings.demo_password or not settings.demo_password.get_secret_value():
+        raise RuntimeError("DEMO_PASSWORD is not set: the demo user needs a password")

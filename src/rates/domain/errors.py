@@ -31,6 +31,10 @@ class StorageUnavailable(DomainError):
     pass
 
 
+class AuditUnavailable(DomainError):
+    """The audit record for a rate could not be stored: the rate must not be returned."""
+
+
 class SnapshotRejected(DomainError):
     """A BoI snapshot failed validation; nothing from it may be stored."""
 

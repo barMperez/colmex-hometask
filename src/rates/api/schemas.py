@@ -138,3 +138,11 @@ class ReadinessOut(CamelModel):
             "already missing: load the next year's BoI list."
         )
     )
+
+
+class TokenOut(BaseModel):
+    """OAuth2 token response (snake_case field names, as the OAuth2 spec requires)."""
+
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int = Field(description="Seconds until the token expires.")

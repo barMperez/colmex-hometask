@@ -5,14 +5,16 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import httpx
+import jwt
 import pytest
 import respx
-from sqlalchemy import update
+from sqlalchemy import select, update
 
-from rates.adapters.db.repos import SqlRefreshStatusRepository
+from rates.adapters.db.repos import SqlAuditRepository, SqlRefreshStatusRepository
 from rates.adapters.db.session import create_engine
-from rates.adapters.db.tables import currency_pairs, non_publication_days
+from rates.adapters.db.tables import audit_events, currency_pairs, non_publication_days, rate_observations
 from rates.api.app import create_app
+from rates.api.auth import Principal
 from rates.clock import FixedClock
 from rates.domain.models import BOI_TIMEZONE
 from rates.services.ingestion import IngestionService
@@ -20,6 +22,13 @@ from rates.settings import Settings
 from tests.fixtures import boi_fixture
 
 PROBLEM = "application/problem+json"
+JWT_SECRET = "contract-test-secret-0123456789abcdef"
+DEMO_USER = "demo"
+DEMO_PASSWORD = "demo-password"
+
+
+def auth_settings() -> Settings:
+    return Settings(_env_file=None, jwt_secret=JWT_SECRET, demo_password=DEMO_PASSWORD)
 
 
 def il(*args) -> datetime:
@@ -43,12 +52,21 @@ async def make_client():
     """Factory: an HTTP client over the app, with an injected engine and clock."""
     stack = []
 
-    async def factory(engine, now: datetime):
+    async def factory(engine, now: datetime, authenticated: bool = True):
+        """``authenticated``: send a valid demo-user bearer token on every request."""
         clock = FixedClock(now)
-        app = create_app(settings=Settings(_env_file=None), engine=engine, clock=clock)
+        app = create_app(settings=auth_settings(), engine=engine, clock=clock)
         lifespan = app.router.lifespan_context(app)
         await lifespan.__aenter__()
-        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        headers = {}
+        if authenticated:
+            token = app.state.token_authority.issue(Principal(DEMO_USER)).access_token
+            headers["Authorization"] = f"Bearer {token}"
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers
+        )
+        client.app = app  # for tests that need the clock or the authority
+        client.clock = clock
         stack.append((lifespan, client))
         return client
 
@@ -325,3 +343,254 @@ async def test_openapi_marks_eligibility_required(engine, make_client):
     responses = spec["paths"]["/api/v1/exchange-rates"]["get"]["responses"]
     assert PROBLEM in responses["503"]["content"]
     assert "Problem" in schemas
+
+
+# --- Authentication: token endpoint ---------------------------------------------
+
+async def login(client, username=DEMO_USER, password=DEMO_PASSWORD):
+    data = {"username": username, "password": password}
+    return await client.post("/api/v1/auth/token", data=data)
+
+
+async def test_login_issues_bearer_token(engine, make_client, caplog):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+
+    with caplog.at_level("DEBUG"):
+        response = await login(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert body["expires_in"] == 3600
+    claims = jwt.decode(body["access_token"], options={"verify_signature": False})
+    assert claims["sub"] == "demo"
+    assert DEMO_PASSWORD not in caplog.text
+    assert body["access_token"] not in caplog.text
+
+
+@pytest.mark.parametrize(("username", "password"), [(DEMO_USER, "wrong"), ("mallory", DEMO_PASSWORD)])
+async def test_login_rejects_bad_credentials(engine, make_client, caplog, username, password):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+
+    with caplog.at_level("DEBUG"):
+        response = await login(client, username, password)
+
+    assert response.status_code == 401
+    assert response.headers["content-type"] == PROBLEM
+    assert response.json()["code"] == "INVALID_CREDENTIALS"
+    assert "access_token" not in response.json()
+    assert password not in caplog.text
+
+
+async def test_login_missing_password_is_invalid_request(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    response = await client.post("/api/v1/auth/token", data={"username": DEMO_USER})
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_REQUEST"
+    assert "ISO 4217" not in response.json()["detail"]
+
+
+# --- Authentication: protected rates endpoint ------------------------------------
+
+async def test_read_without_token_is_401(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+
+    response = await get(client, "base=USD&quote=ILS")
+
+    assert response.status_code == 401
+    assert response.headers["content-type"] == PROBLEM
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["code"] == "AUTHENTICATION_REQUIRED"
+    assert "rate" not in response.json()
+
+
+async def test_authentication_is_checked_before_parameters(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    response = await get(client, "base=US1")
+    assert response.status_code == 401
+
+
+async def test_expired_token_is_401_invalid_token(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))  # token issued at 10:00, 1 h lifetime
+    client.clock.set(il(2026, 11, 24, 11, 0, 1))
+
+    response = await get(client, "base=USD&quote=ILS")
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "INVALID_TOKEN"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+async def test_tampered_token_is_401_invalid_token(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    forged = jwt.encode(
+        {"sub": "demo", "iat": 0, "exp": 4_000_000_000, "iss": "rates-api", "aud": "rates-api"},
+        "attacker-secret-0123456789abcdefghij",
+        algorithm="HS256",
+    )
+
+    response = await client.get(
+        "/api/v1/exchange-rates?base=USD&quote=ILS", headers={"Authorization": f"Bearer {forged}"}
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "INVALID_TOKEN"
+
+
+async def test_token_from_login_works_for_reads(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    token = (await login(client)).json()["access_token"]
+
+    response = await client.get(
+        "/api/v1/exchange-rates?base=USD&quote=ILS", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["rate"] == "3.343"
+
+
+@pytest.mark.parametrize("path", ["/health/live", "/health/ready", "/openapi.json", "/docs"])
+async def test_operational_endpoints_stay_open(engine, make_client, path):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    assert (await client.get(path)).status_code == 200
+
+
+async def test_openapi_declares_bearer_security(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+    spec = (await client.get("/openapi.json")).json()
+
+    schemes = spec["components"]["securitySchemes"]
+    (name, scheme), = schemes.items()
+    assert scheme["type"] == "oauth2"
+    assert scheme["flows"]["password"]["tokenUrl"] == "/api/v1/auth/token"
+
+    op = spec["paths"]["/api/v1/exchange-rates"]["get"]
+    assert {name: []} in op["security"]
+    assert "401" in op["responses"]
+    assert "AUDIT_UNAVAILABLE" in op["responses"]["503"]["description"]
+    assert "/api/v1/auth/token" in spec["paths"]
+    assert "security" not in spec["paths"]["/health/ready"]["get"]
+
+
+# --- Rate-query audit -------------------------------------------------------------
+
+async def audit_rows(engine):
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(audit_events)
+                .where(audit_events.c.event_type == "RATE_QUERIED")
+                .order_by(audit_events.c.occurred_at)
+            )
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def test_successful_read_is_audited_with_what_the_user_was_told(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 16, 30))  # USD overdue: NOT_ELIGIBLE
+
+    response = await get(client, "base=usd&quote=ils")
+
+    assert response.status_code == 200
+    body = response.json()
+    (row,) = await audit_rows(engine)
+    assert row["actor"] == "demo"
+    assert row["entity_type"] == "rate_observation"
+    assert row["entity_id"] == body["rateId"]
+    assert row["after"]["request"] == {"base": "usd", "quote": "ils"}  # as sent
+    recorded = row["after"]["response"]
+    assert recorded["status"] == 200
+    for field in ("rateId", "rate", "publicationDate", "eligibility"):
+        assert recorded[field] == body[field]
+    assert recorded["eligibility"]["status"] == "NOT_ELIGIBLE"
+    async with engine.connect() as conn:
+        ids = {str(i) for i in (await conn.execute(select(rate_observations.c.id))).scalars()}
+    assert recorded["rateId"] in ids
+
+
+async def test_audit_failure_withholds_the_rate(engine, make_client, monkeypatch, caplog):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+
+    async def broken(self, event):
+        raise RuntimeError("audit store down")
+
+    monkeypatch.setattr(SqlAuditRepository, "record", broken)
+    with caplog.at_level("ERROR"):
+        response = await get(client, "base=USD&quote=ILS")
+
+    assert response.status_code == 503
+    assert response.headers["content-type"] == PROBLEM
+    assert response.json()["code"] == "AUDIT_UNAVAILABLE"
+    assert "rate" not in response.json()
+    assert "audit_unavailable" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("query", "now", "status", "code", "request_params"),
+    [
+        ("base=ILS&quote=USD", il(2026, 11, 24, 10, 0), 422, "UNSUPPORTED_CURRENCY_PAIR",
+         {"base": "ILS", "quote": "USD"}),
+        ("base=USD", il(2026, 11, 24, 10, 0), 400, "INVALID_REQUEST", {"base": "USD", "quote": None}),
+        ("base=USD&quote=ILS", il(2028, 1, 4, 10, 0), 503, "POLICY_NOT_EVALUABLE",
+         {"base": "USD", "quote": "ILS"}),
+    ],
+    ids=["422", "400", "503-policy"],
+)
+async def test_rejected_reads_are_audited(engine, make_client, query, now, status, code, request_params):
+    await ingest(engine)
+    client = await make_client(engine, now)
+
+    response = await get(client, query)
+
+    assert response.status_code == status
+    (row,) = await audit_rows(engine)
+    assert row["actor"] == "demo"
+    assert row["entity_type"] == "rate_query"
+    assert row["after"]["request"] == request_params
+    assert row["after"]["response"] == {"status": status, "code": code, "rateId": None}
+
+
+async def test_fresh_install_404_is_audited(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+    assert (await get(client, "base=EUR&quote=ILS")).status_code == 404
+    (row,) = await audit_rows(engine)
+    assert row["after"]["response"]["code"] == "RATE_NOT_FOUND"
+
+
+async def test_unauthenticated_reads_are_not_audited(engine, make_client, caplog):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0), authenticated=False)
+
+    with caplog.at_level("INFO"):
+        assert (await get(client, "base=USD&quote=ILS")).status_code == 401
+
+    assert await audit_rows(engine) == []
+    assert "auth.rejected code=AUTHENTICATION_REQUIRED" in caplog.text
+
+
+async def test_token_endpoint_errors_are_not_audited(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))  # holds a valid token
+    assert (await client.post("/api/v1/auth/token", data={"username": "demo"})).status_code == 400
+    assert (await login(client, password="wrong")).status_code == 401
+    assert await audit_rows(engine) == []
+
+
+async def test_failed_audit_on_rejection_keeps_the_response(engine, make_client, monkeypatch, caplog):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+
+    async def broken(self, event):
+        raise RuntimeError("audit store down")
+
+    monkeypatch.setattr(SqlAuditRepository, "record", broken)
+    with caplog.at_level("ERROR"):
+        response = await get(client, "base=ILS&quote=USD")
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "UNSUPPORTED_CURRENCY_PAIR"
+    assert "audit.write_failed status=422" in caplog.text

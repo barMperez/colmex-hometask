@@ -2,8 +2,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from rates.api.problems import problem_openapi
+from rates.api.auth import Principal, current_user
+from rates.api.problems import AUDIT_FLAG, problem_openapi
 from rates.api.schemas import ExchangeRateOut, NotEligiblePairOut, ReadinessOut
+from rates.domain.errors import AuditUnavailable
+from rates.services.query_audit import QueryAuditService, QueryOutcome
 from rates.services.rate_query import RateQueryService
 
 CURRENCY_PATTERN = r"^[A-Za-z]{3}$"
@@ -15,6 +18,15 @@ def get_service(request: Request) -> RateQueryService:
     return request.app.state.rate_query
 
 
+def get_query_audit(request: Request) -> QueryAuditService:
+    return request.app.state.query_audit
+
+
+def mark_audited(request: Request) -> None:
+    """Route-level flag: errors on this route are written to the rate-query audit trail."""
+    setattr(request.state, AUDIT_FLAG, True)
+
+
 CurrencyCode = Annotated[
     str,
     Query(pattern=CURRENCY_PATTERN, description="ISO 4217 alphabetic code (case-insensitive)", examples=["USD"]),
@@ -23,6 +35,7 @@ CurrencyCode = Annotated[
 
 @router.get(
     "/api/v1/exchange-rates",
+    dependencies=[Depends(mark_audited)],
     response_model=ExchangeRateOut,
     summary="Latest BoI representative rate for a currency pair",
     description=(
@@ -37,18 +50,32 @@ CurrencyCode = Annotated[
     ),
     responses={
         400: problem_openapi("INVALID_REQUEST"),
+        401: problem_openapi("AUTHENTICATION_REQUIRED", "INVALID_TOKEN"),
         404: problem_openapi("RATE_NOT_FOUND"),
         422: problem_openapi("UNSUPPORTED_CURRENCY_PAIR"),
-        503: problem_openapi("POLICY_NOT_EVALUABLE", "STORAGE_UNAVAILABLE"),
+        503: problem_openapi("POLICY_NOT_EVALUABLE", "STORAGE_UNAVAILABLE", "AUDIT_UNAVAILABLE"),
     },
 )
 async def get_exchange_rate(
+    principal: Annotated[Principal, Depends(current_user)],
     base: CurrencyCode,
     quote: CurrencyCode,
     service: Annotated[RateQueryService, Depends(get_service)],
+    audit: Annotated[QueryAuditService, Depends(get_query_audit)],
+    request: Request,
 ) -> ExchangeRateOut:
     view = await service.get_rate(base.upper(), quote.upper())
-    return ExchangeRateOut.from_view(view)
+    body = ExchangeRateOut.from_view(view)
+    # Fail closed: the rate leaves the service only once its audit record is committed.
+    try:
+        await audit.record(
+            principal.username,
+            request.query_params,
+            QueryOutcome(200, response=body.model_dump(mode="json", by_alias=True)),
+        )
+    except Exception as exc:
+        raise AuditUnavailable("The audit trail is unavailable; no rate was returned") from exc
+    return body
 
 
 @router.get("/health/live", summary="Process is up", tags=["health"])

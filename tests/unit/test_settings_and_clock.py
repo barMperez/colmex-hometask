@@ -26,6 +26,10 @@ def test_settings_defaults(monkeypatch):
     assert settings.refresh_dense_interval_seconds == 60
     assert settings.refresh_dense_tail_minutes == 30
     assert settings.calendar_warning_days == 60
+    assert settings.jwt_secret is None
+    assert settings.jwt_ttl_seconds == 3600
+    assert settings.demo_username == "demo"
+    assert settings.demo_password is None
 
 
 def test_fixed_clock_returns_aware_utc():
