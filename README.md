@@ -11,27 +11,54 @@ This service fetches BoI rates in the background, stores every verified observat
 
 > **What a representative rate is not.** BoI publishes one representative rate per business day, based on interbank trading during a short sampling window. It "has no obligatory status under law" and is **not an executable trade price**. Consumers that need a tradeable quote need a quoting service; this API is a reference-rate service.
 
-<!-- Sections below are completed as implementation progresses. -->
+**Documents in this repository**
+
+| File | What it is |
+|---|---|
+| `README.md` (this file) | How to run it, how it behaves, decisions, limitations |
+| [`WRITEUP.md`](WRITEUP.md) | How the solution was built: brainstorm, BoI API exploration, architecture, how it evolved |
+| [`docs/brainstorm.md`](docs/brainstorm.md) | The pre-implementation design exploration |
+| [`openspec/`](openspec/) | Behaviour specs (`specs/`) and every change's proposal, design and tasks (`changes/archive/`) |
 
 ## 2. Quick start
 
-Requires Docker. Starts Postgres, runs migrations and seeds, then the API and the refresh process:
+**Prerequisites:** Docker with Docker Compose v2 (Docker Desktop on Windows/macOS), `curl`, and free ports 8000 and 5433. Python is only needed for the local run without Docker (§7).
+
+**1. Start everything** (Postgres, migrations and seed data, the API and the refresh process):
 
 ```bash
-docker compose up --build
+git clone https://github.com/barMperez/colmex-hometask.git
+cd colmex-hometask
+docker compose up --build -d
 ```
 
-Rate reads need a bearer token. Compose ships a **demo-only** user (`demo` / `demo-password`):
+**2. Wait until it is ready** (a few seconds after the build; the refresh process fetches live BoI rates on its first poll):
 
 ```bash
-TOKEN=$(curl -s -d username=demo -d password=demo-password   http://localhost:8000/api/v1/auth/token | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+docker compose ps -a                     # api shows "(healthy)", migrate "Exited (0)"
+curl http://localhost:8000/health/ready  # 200; notEligiblePairs [] once rates are in
+```
+
+**3. Get a token and read a rate.** Compose ships a **demo-only** user, `demo` / `demo-password`:
+
+```bash
+TOKEN=$(curl -s -d username=demo -d password=demo-password http://localhost:8000/api/v1/auth/token \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
 
 curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"
-curl "http://localhost:8000/health/ready"      # no token needed
-open http://localhost:8000/docs                # Swagger UI: "Authorize" with demo / demo-password
 ```
 
-The token lasts an hour (`expires_in: 3600`). Without one, reads return **401** `AUTHENTICATION_REQUIRED`; with an expired or tampered one, 401 `INVALID_TOKEN`. Every authenticated read is written to the audit trail (§7).
+No Python on the host? Copy `access_token` from the JSON that `curl -d username=demo -d password=demo-password http://localhost:8000/api/v1/auth/token` prints. Or open the Swagger UI at <http://localhost:8000/docs>, click **Authorize**, enter `demo` / `demo-password`, and try the endpoint there.
+
+**4. Look around and stop:**
+
+```bash
+docker compose logs -f refresh           # polling, ingestion and alert log lines
+docker compose down                      # stop (keeps the database volume)
+docker compose down -v                   # stop and delete all data
+```
+
+The token lasts an hour (`expires_in: 3600`). Without one, reads return **401** `AUTHENTICATION_REQUIRED`; with an expired or tampered one, 401 `INVALID_TOKEN`. Every authenticated read is written to the audit trail (§7). To run without Docker (SQLite), and for tests, see §7.
 
 Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes are case-insensitive.
 
@@ -212,7 +239,7 @@ This script is the only runtime policy change in this release. Changing grace or
 
 ## 5. Decisions and trade-offs
 
-The full design record, including the alternatives considered, is in [`openspec/changes/add-exchange-rates-api/design.md`](openspec/changes/add-exchange-rates-api/design.md). The behaviour contracts, with testable scenarios, are in its `specs/` folder.
+The full design record, including the alternatives considered, is in [`openspec/changes/archive/2026-11-24-add-exchange-rates-api/design.md`](openspec/changes/archive/2026-11-24-add-exchange-rates-api/design.md), and each later change has its own `design.md` next to it. The current behaviour contracts, with testable scenarios, are in [`openspec/specs/`](openspec/specs/).
 
 | # | Decision | Why | Trade-off / cost |
 |---|---|---|---|
@@ -285,12 +312,13 @@ The full design record, including the alternatives considered, is in [`openspec/
 python -m venv .venv
 .venv/Scripts/activate            # Windows; on Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
+cp .env.example .env              # demo JWT_SECRET and DEMO_PASSWORD: the API won't start without them
 alembic upgrade head              # creates ./rates.db with schema + seeds
 python -m rates.refresh           # terminal 1: the single writer
 python -m rates.api               # terminal 2: http://127.0.0.1:8000
 ```
 
-Configuration is via environment variables or a `.env` file. See [`.env.example`](.env.example).
+Configuration is via environment variables or a `.env` file. See [`.env.example`](.env.example). The refresh process doesn't need the auth settings; the API refuses to start without `JWT_SECRET` (at least 32 characters) and `DEMO_PASSWORD`.
 
 **Tests**
 
@@ -417,6 +445,7 @@ Natural extensions:
 AI assistance (Claude) was used for:
 - design exploration: the freshness policy, the API semantics and their trade-offs, captured as an OpenSpec change (proposal, specs, design, tasks) under `openspec/`;
 - checking BoI's actual API payload, publication schedule and holiday calendar;
-- drafting the implementation and tests task by task against those specs.
+- drafting the implementation and tests task by task against those specs;
+- reviewing the result against the specs, and turning each finding into a follow-up change (verification fixes, deposit-availability hardening, demo auth and audit).
 
-Every decision above was discussed and chosen explicitly. The code is covered by tests derived from the spec scenarios.
+Every decision above was discussed and chosen explicitly. The code is covered by tests derived from the spec scenarios. [`WRITEUP.md`](WRITEUP.md) describes the process in more detail.
