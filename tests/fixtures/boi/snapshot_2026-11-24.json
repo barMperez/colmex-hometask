@@ -1,7 +1,7 @@
 {"exchangeRates":[
-{"key":"USD","currentExchangeRate":3.343,"currentChange":0.5111244738424533974744437800,"unit":1,"lastUpdate":"2026-11-24T13:25:00Z"},
-{"key":"GBP","currentExchangeRate":4.3785,"currentChange":0.4150995321530134850013760200,"unit":1,"lastUpdate":"2026-11-24T13:25:00Z"},
-{"key":"JPY","currentExchangeRate":2.1026,"currentChange":0.5643772718576621388942031800,"unit":100,"lastUpdate":"2026-11-24T13:25:00Z"},
-{"key":"EUR","currentExchangeRate":3.665,"currentChange":0.4027066268525874585650494500,"unit":1,"lastUpdate":"2026-11-24T13:25:00Z"},
-{"key":"LBP","currentExchangeRate":0.0004,"currentChange":0,"unit":10,"lastUpdate":"2026-11-24T13:25:00Z"}
+{"key":"USD","currentExchangeRate":3.351,"currentChange":0.2393060125635657,"unit":1,"lastUpdate":"2026-11-24T13:25:00Z"},
+{"key":"GBP","currentExchangeRate":4.381,"currentChange":0.06,"unit":1,"lastUpdate":"2026-11-24T13:20:05Z"},
+{"key":"JPY","currentExchangeRate":2.1031,"currentChange":0.0237800818034814,"unit":100,"lastUpdate":"2026-11-24T13:20:05Z"},
+{"key":"EUR","currentExchangeRate":3.667,"currentChange":0.05,"unit":1,"lastUpdate":"2026-11-24T13:20:05Z"},
+{"key":"LBP","currentExchangeRate":0.0004,"currentChange":0,"unit":10,"lastUpdate":"2026-11-24T13:20:05Z"}
 ]}

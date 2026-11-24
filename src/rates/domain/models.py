@@ -45,10 +45,15 @@ class RateObservation:
     retrieved_at: datetime
     revision: int = 0
     """0 for the first value BoI sent for (pair, source_last_update); +1 per restatement."""
+    source_change: Decimal | None = None
+    """BoI's ``currentChange`` (percent change from the previous publication), as sent.
+    None when BoI omitted it or the row predates migration 0005."""
 
     def __post_init__(self) -> None:
         _require_decimal("rate", self.rate)
         _require_decimal("source_rate", self.source_rate)
+        if self.source_change is not None:
+            _require_decimal("source_change", self.source_change)
         if isinstance(self.source_unit, bool) or not isinstance(self.source_unit, int):
             raise TypeError("source_unit must be an int")
         _require_aware("source_last_update", self.source_last_update)

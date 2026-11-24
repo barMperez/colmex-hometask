@@ -53,6 +53,8 @@ rate_observations = Table(
     Column("retrieved_at", UtcDateTime, nullable=False),
     # 0 for the first value BoI sent for (pair, source_last_update); +1 per restatement.
     Column("revision", Integer, nullable=False, server_default=text("0")),
+    # BoI's currentChange; NULL if BoI omitted it or the row predates migration 0005.
+    Column("source_change", DecimalText, nullable=True),
     ForeignKeyConstraint(
         ["base_currency", "quote_currency"],
         ["currency_pairs.base_currency", "currency_pairs.quote_currency"],

@@ -211,35 +211,225 @@ async def test_identical_reingest_logs_no_correction(engine, caplog):
     assert await count(engine, audit_events) == 1
 
 
-async def test_morning_restatement_does_not_make_a_stale_rate_eligible(engine):
-    """Regression: publicationDate was the calendar date of BoI's lastUpdate.
+# --- Re-stamps and publication dates (regression) ---------------------------
+# BoI can move lastUpdate without publishing. Before the fix, a new lastUpdate was
+# stored as a new publication dated by its calendar day, so a stale rate was
+# ELIGIBLE after the day's deadline.
 
-    Monday's rate is ingested; on Tuesday at 10:00 Israel time BoI re-stamps USD
-    (new lastUpdate, same value) and never publishes Tuesday's rate. After Tuesday's
-    16:00 deadline the rate must be PUBLICATION_OVERDUE, not ELIGIBLE.
-    """
-    from rates.domain.models import EligibilityReason, EligibilityStatus
-    from rates.services.rate_query import RateQueryService
+from rates.domain.models import BOI_TIMEZONE, EligibilityReason, EligibilityStatus  # noqa: E402
+from rates.services.rate_query import RateQueryService  # noqa: E402
 
-    await service(engine, "snapshot_2026-11-23.json").run_once()
 
-    restated = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
-    restated["exchangeRates"][0]["lastUpdate"] = "2026-11-24T08:00:00Z"  # USD, Tue 10:00 IL
+def il(y, m, d, hh, mm=0) -> datetime:
+    return datetime(y, m, d, hh, mm, tzinfo=BOI_TIMEZONE).astimezone(UTC)
 
-    class Restated:
-        async def fetch(self):
-            return restated
 
-    tuesday_morning = FixedClock(datetime(2026, 11, 24, 8, 5, tzinfo=UTC))
-    result = await IngestionService(engine, Restated(), tuesday_morning).run_once()
-    assert result.rejected == []
+def monday(**overrides) -> dict:
+    """snapshot_2026-11-23.json with per-currency overrides: {"USD": {"lastUpdate": ...}}."""
+    payload = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    for entry in payload["exchangeRates"]:
+        entry.update(overrides.get(entry["key"], {}))
+    return payload
+
+
+def restamped_all(at: datetime) -> dict:
+    """Monday's snapshot, unchanged, with every lastUpdate moved to ``at``."""
+    stamp = at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return monday(**{k: {"lastUpdate": stamp} for k in ("USD", "EUR", "GBP", "JPY", "LBP")})
+
+
+class PayloadSource:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    async def fetch(self):
+        return self._payload
+
+
+async def ingest_payload(engine, payload: dict, at: datetime):
+    return await IngestionService(engine, PayloadSource(payload), FixedClock(at)).run_once()
+
+
+async def ingest_monday(engine):
+    return await ingest_payload(engine, monday(), il(2026, 11, 23, 15, 25))
+
+
+async def usd_at(engine, at: datetime):
+    return await RateQueryService(engine, FixedClock(at)).get_rate("USD", "ILS")
+
+
+def stamp(at: datetime) -> str:
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def test_restamp_inside_todays_window_is_not_a_publication(engine, caplog):
+    """The reported gap: Monday's rate re-stamped Tue 17:00, Tuesday never published."""
+    await ingest_monday(engine)
+
+    with caplog.at_level("WARNING", logger="rates.services.ingestion"):
+        result = await ingest_payload(engine, restamped_all(il(2026, 11, 24, 17)), il(2026, 11, 24, 17, 5))
+
+    assert result.inserted == 0
+    assert result.outcome == "success"  # BoI answered; nothing new is not a failure
+    assert sorted(r.currency for r in result.restamped) == ["EUR", "GBP", "USD"]
     assert result.latest_publication_date == date(2026, 11, 23)
+    assert await count(engine, rate_observations) == 3
+    assert await count(engine, audit_events) == 1  # only Monday's ingestion
+    assert caplog.text.count("rates.restamp_ignored") == 3
 
-    after_deadline = FixedClock(datetime(2026, 11, 24, 14, 1, tzinfo=UTC))  # Tue 16:01 IL
-    view = await RateQueryService(engine, after_deadline).get_rate("USD", "ILS")
-
-    assert view.observation.source_last_update == datetime(2026, 11, 24, 8, 0, tzinfo=UTC)
+    view = await usd_at(engine, il(2026, 11, 24, 17, 10))
     assert view.observation.publication_date == date(2026, 11, 23)
     assert view.eligibility.status is EligibilityStatus.NOT_ELIGIBLE
     assert view.eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
     assert view.eligibility.required_publication_date == date(2026, 11, 24)
+
+
+async def test_morning_restamp_stores_nothing_and_turns_overdue_at_the_deadline(engine):
+    await ingest_monday(engine)
+    await ingest_payload(engine, restamped_all(il(2026, 11, 24, 10)), il(2026, 11, 24, 10, 5))
+
+    assert await count(engine, rate_observations) == 3
+    assert (await usd_at(engine, il(2026, 11, 24, 10, 10))).eligibility.is_eligible
+    late = await usd_at(engine, il(2026, 11, 24, 16, 1))
+    assert late.eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+
+
+async def test_restamps_every_day_never_make_the_rate_eligible(engine):
+    await ingest_monday(engine)
+    for day in (24, 25, 26):  # BoI re-stamps Tue, Wed and Thu afternoons, never publishes
+        await ingest_payload(engine, restamped_all(il(2026, 11, day, 17)), il(2026, 11, day, 17, 5))
+        view = await usd_at(engine, il(2026, 11, day, 17, 10))
+        assert view.eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+        assert view.observation.publication_date == date(2026, 11, 23)
+    assert await count(engine, rate_observations) == 3
+
+
+async def test_unchanged_rate_publication_is_eligible(engine):
+    # BoI publishes Tuesday's USD rate equal to Monday's: currentChange is 0.
+    await ingest_monday(engine)
+    tuesday = monday(USD={"lastUpdate": stamp(il(2026, 11, 24, 15, 21)), "currentChange": 0})
+    result = await ingest_payload(engine, tuesday, il(2026, 11, 24, 15, 25))
+
+    assert result.inserted == 1
+    assert result.restamped == []  # EUR/GBP kept Monday's lastUpdate: an idempotent re-fetch
+    view = await usd_at(engine, il(2026, 11, 24, 16, 1))
+    assert view.eligibility.is_eligible
+    assert view.observation.publication_date == date(2026, 11, 24)
+    assert view.observation.source_change == 0
+
+
+async def test_restamp_then_real_publication_same_day(engine):
+    await ingest_monday(engine)
+    await ingest_payload(engine, restamped_all(il(2026, 11, 24, 10)), il(2026, 11, 24, 10, 5))
+    tuesday = json.loads(boi_fixture("snapshot_2026-11-24.json"), parse_float=Decimal)
+    result = await ingest_payload(engine, tuesday, il(2026, 11, 24, 15, 30))
+
+    assert result.inserted == 3 and result.restamped == []
+    view = await usd_at(engine, il(2026, 11, 24, 16, 1))
+    assert view.eligibility.is_eligible
+    assert view.observation.rate == Decimal("3.351")
+
+
+async def test_restamp_of_todays_publication_keeps_it_current(engine):
+    tuesday = json.loads(boi_fixture("snapshot_2026-11-24.json"), parse_float=Decimal)
+    await ingest_payload(engine, tuesday, il(2026, 11, 24, 15, 30))
+    for e in tuesday["exchangeRates"]:
+        e["lastUpdate"] = stamp(il(2026, 11, 24, 18))
+    result = await ingest_payload(engine, tuesday, il(2026, 11, 24, 18, 5))
+
+    assert result.inserted == 0
+    view = await usd_at(engine, il(2026, 11, 24, 18, 10))
+    assert view.eligibility.is_eligible
+    assert view.observation.source_last_update == datetime(2026, 11, 24, 13, 25, tzinfo=UTC)
+
+
+async def test_morning_correction_is_stored_but_keeps_mondays_date(engine):
+    await ingest_monday(engine)
+    corrected = monday(USD={"lastUpdate": stamp(il(2026, 11, 24, 10)), "currentExchangeRate": Decimal("3.341"),
+                            "currentChange": Decimal("0.45")})
+    result = await ingest_payload(engine, corrected, il(2026, 11, 24, 10, 5))
+
+    assert result.inserted == 1
+    assert (await usd_at(engine, il(2026, 11, 24, 10, 10))).observation.rate == Decimal("3.341")
+    late = await usd_at(engine, il(2026, 11, 24, 16, 1))
+    assert late.observation.publication_date == date(2026, 11, 23)
+    assert late.eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+
+
+async def test_mixed_snapshot_stores_publications_and_skips_restamps(engine):
+    await ingest_monday(engine)
+    tuesday = json.loads(boi_fixture("snapshot_2026-11-24.json"), parse_float=Decimal)
+    usd = tuesday["exchangeRates"][0]
+    assert usd["key"] == "USD"
+    usd.update(currentExchangeRate=Decimal("3.343"), currentChange=monday()["exchangeRates"][0]["currentChange"],
+               lastUpdate=stamp(il(2026, 11, 24, 17)))
+    result = await ingest_payload(engine, tuesday, il(2026, 11, 24, 17, 5))
+
+    assert result.inserted == 2
+    assert [r.currency for r in result.restamped] == ["USD"]
+    assert result.latest_publication_date == date(2026, 11, 24)
+    async with engine.connect() as conn:
+        audit = (await conn.execute(select(audit_events).order_by(audit_events.c.occurred_at.desc()))).mappings().first()
+    assert sorted(o["pair"] for o in audit["after"]["observations"]) == ["EUR/ILS", "GBP/ILS"]
+    assert (await usd_at(engine, il(2026, 11, 24, 17, 10))).eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+
+
+async def test_legacy_row_without_change_fails_closed(engine):
+    """Rows stored before migration 0005 have no change: identical rate is a re-stamp."""
+    await ingest_monday(engine)
+    async with engine.begin() as conn:
+        await conn.execute(rate_observations.update().values(source_change=None))
+    result = await ingest_payload(engine, restamped_all(il(2026, 11, 24, 17)), il(2026, 11, 24, 17, 5))
+
+    assert result.inserted == 0
+    assert (await usd_at(engine, il(2026, 11, 24, 17, 10))).eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+
+
+async def test_source_change_round_trips_exactly(engine):
+    changes = {"USD": Decimal("0.5111244738424534"), "EUR": Decimal("-0.0709026452140714"), "GBP": Decimal("0")}
+    payload = monday(**{k: {"currentChange": v} for k, v in changes.items()})
+    await ingest_payload(engine, payload, il(2026, 11, 23, 15, 25))
+    async with engine.connect() as conn:
+        rows = dict((await conn.execute(
+            select(rate_observations.c.base_currency, rate_observations.c.source_change)
+        )).all())
+    assert rows == changes
+    assert all(isinstance(v, Decimal) for v in rows.values())
+
+
+async def test_missing_change_is_stored_as_null(engine):
+    payload = monday()
+    for e in payload["exchangeRates"]:
+        e.pop("currentChange")
+    await ingest_payload(engine, payload, il(2026, 11, 23, 15, 25))
+    async with engine.connect() as conn:
+        values = set((await conn.execute(select(rate_observations.c.source_change))).scalars())
+    assert values == {None}
+
+
+async def test_same_timestamp_change_only_difference_is_not_a_correction(engine):
+    # usd_late_2026-11-24.json repeats Monday's USD lastUpdate with currentChange
+    # rounded (0.51): the rate is unchanged, so no revision is created.
+    await ingest_monday(engine)
+    result = await IngestionService(
+        engine, FakeSource("usd_late_2026-11-24.json"), FixedClock(il(2026, 11, 24, 15, 25))
+    ).run_once()
+    assert result.corrections == []
+    async with engine.connect() as conn:
+        usd_rows = (await conn.execute(
+            select(func.count()).select_from(rate_observations).where(rate_observations.c.base_currency == "USD")
+        )).scalar_one()
+    assert usd_rows == 1
+
+
+async def test_restamp_with_nothing_stored_is_a_publication_inside_the_window(engine):
+    # Fresh database: there is nothing to compare with, so window timing decides.
+    result = await ingest_payload(engine, restamped_all(il(2026, 11, 24, 17)), il(2026, 11, 24, 17, 5))
+    assert result.inserted == 3 and result.restamped == []
+    assert (await usd_at(engine, il(2026, 11, 24, 17, 10))).observation.publication_date == date(2026, 11, 24)
+
+
+async def test_correction_outside_window_with_nothing_stored_is_rejected(engine):
+    with pytest.raises(SnapshotRejected, match="no stored rate"):
+        await ingest_payload(engine, restamped_all(il(2026, 11, 24, 10)), il(2026, 11, 24, 10, 5))
+    assert await count(engine, rate_observations) == 0

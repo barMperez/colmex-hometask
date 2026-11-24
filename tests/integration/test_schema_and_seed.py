@@ -134,3 +134,33 @@ async def test_downgrade_refuses_while_corrections_are_stored(engine, migrated_u
         )
     cols, _ = await _columns_and_uniques(migrated_url)
     assert "revision" in cols  # nothing was undone
+
+
+async def test_source_change_column(migrated_url):
+    cols, _ = await _columns_and_uniques(migrated_url)
+    assert "source_change" in cols and cols["source_change"]["nullable"] is True
+
+
+async def test_0005_downgrade_and_upgrade_keep_rates(engine, migrated_url):
+    ts = datetime(2026, 11, 23, 13, 21, 10, tzinfo=UTC)
+    row = {"id": uuid4(), "base_currency": "USD", "quote_currency": "ILS", "rate": Decimal("3.343"),
+           "source_rate": Decimal("3.343"), "source_unit": 1, "publication_date": date(2026, 11, 23),
+           "source_last_update": ts, "retrieved_at": ts, "revision": 0, "source_change": Decimal("0.511")}
+    async with engine.begin() as conn:
+        await conn.execute(rate_observations.insert(), [row])
+    await engine.dispose()  # release SQLite connections before altering the table
+
+    cfg = alembic_config(migrated_url)
+    await _run_sync_alembic(lambda: command.downgrade(cfg, "0004_revisions_and_exact_numeric"))
+    cols, _ = await _columns_and_uniques(migrated_url)
+    assert "source_change" not in cols
+
+    await _run_sync_alembic(lambda: command.upgrade(cfg, "head"))
+    eng = create_engine(migrated_url)
+    try:
+        async with eng.connect() as conn:
+            stored = (await conn.execute(select(rate_observations))).mappings().one()
+    finally:
+        await eng.dispose()
+    assert stored["source_rate"] == Decimal("3.343")
+    assert stored["source_change"] is None  # rows from before 0005 have no change: unknown

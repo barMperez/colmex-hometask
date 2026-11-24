@@ -65,6 +65,31 @@ The system SHALL store, for each observation, the source rate and source unit as
 - **WHEN** BoI returns JPY with rate 2.1026 and unit 100
 - **THEN** the normalised rate is 0.021026
 
+### Requirement: A re-stamp is not a publication
+The system SHALL store each entry's `currentChange` exactly (NULL when BoI omits it). When an entry's source timestamp differs from that of the pair's current observation but its source rate, source unit and `currentChange` are equal to the current observation's, the entry is a re-stamp: the system SHALL NOT store it, SHALL NOT reject it, and SHALL log it. When either `currentChange` is unknown, equal rate and unit SHALL be treated as a re-stamp (a new publication cannot be proven). A retrieval whose enabled entries are all re-stamps is a successful retrieval with nothing new.
+
+Rationale: BoI can move `lastUpdate` without publishing. A genuine publication changes the content: at least `currentChange`, the change from the previous publication, which is 0 when the rate is unchanged. Timing alone cannot tell a re-stamp inside today's publication window from today's publication.
+
+#### Scenario: Re-stamp inside today's window
+- **GIVEN** the current USD/ILS observation is Monday 2026-11-23's (rate 3.343, change 0.511)
+- **WHEN** BoI returns USD with rate 3.343, change 0.511 and `lastUpdate` Tuesday 17:00 Israel time, and publishes nothing else on Tuesday
+- **THEN** no observation is stored and the re-stamp is logged
+- **AND** at Tuesday 17:10 the rate is NOT_ELIGIBLE with reason PUBLICATION_OVERDUE and publication date 2026-11-23
+
+#### Scenario: Unchanged-rate publication
+- **GIVEN** the current USD/ILS observation is Monday's (rate 3.343, change 0.511)
+- **WHEN** BoI returns USD with rate 3.343, change 0 and `lastUpdate` Tuesday 15:21 Israel time
+- **THEN** a new observation dated 2026-11-24 is stored and is ELIGIBLE after Tuesday's deadline
+
+#### Scenario: Unknown change fails closed
+- **GIVEN** the current USD/ILS observation has no recorded change
+- **WHEN** BoI returns USD with the same rate and unit under a new `lastUpdate`
+- **THEN** it is treated as a re-stamp and nothing is stored
+
+#### Scenario: Re-stamp-only retrieval
+- **WHEN** every enabled entry of a retrieval is a re-stamp
+- **THEN** the attempt outcome is success, nothing is stored and no ingestion audit event is written
+
 ### Requirement: Publication date derivation
 The system SHALL store each entry's own source `lastUpdate` timestamp and SHALL attribute the observation to a publication date as follows. When `lastUpdate`, in Asia/Jerusalem, falls on a business day at or after that day's expected publication time under the active policy, the publication date SHALL be that day (a publication or a same-day correction). Any other `lastUpdate` (before the expected time, or on a weekend or non-publication day) is a restatement of an earlier rate: the observation SHALL keep the publication date of the pair's current stored observation, capped at the latest business day whose expected publication time is at or before `lastUpdate`. A restatement with no stored observation for the pair SHALL be rejected for that currency. When the calendar does not cover the days needed, the snapshot SHALL be rejected.
 
@@ -97,7 +122,7 @@ Rationale: BoI's API has no date field and `lastUpdate` moves whenever BoI touch
 - **AND** both have publication date 2026-11-23
 
 ### Requirement: Per-currency validation
-The system SHALL validate each enabled currency's entry independently. An entry is valid when it is present, has a rate greater than zero, a source unit that is a positive integer, and a publication date not after the current Asia/Jerusalem date. The system SHALL store the valid entries and SHALL reject and log each invalid or missing entry with its reason, without affecting the others. A payload without the expected `exchangeRates` structure SHALL be rejected as a whole.
+The system SHALL validate each enabled currency's entry independently. An entry is valid when it is present, has a rate greater than zero, a source unit that is a positive integer, a `currentChange` that is absent or a finite number, and a publication date not after the current Asia/Jerusalem date. The system SHALL store the valid entries and SHALL reject and log each invalid or missing entry with its reason, without affecting the others. A payload without the expected `exchangeRates` structure SHALL be rejected as a whole.
 
 #### Scenario: Missing enabled currency is rejected alone
 - **GIVEN** USD, EUR and GBP pairs are enabled
@@ -129,7 +154,7 @@ The system SHALL validate each enabled currency's entry independently. An entry 
 
 #### Scenario: Differing timestamps are accepted
 - **WHEN** a snapshot has valid entries whose `lastUpdate` values differ
-- **THEN** each entry's new observation is stored
+- **THEN** each entry's new observation is stored, except re-stamps
 
 ### Requirement: Atomic and idempotent persistence
 The system SHALL store all new observations of the accepted currencies from one retrieval atomically. An entry whose pair, source timestamp, source rate and source unit equal those of the latest stored revision for that pair and source timestamp SHALL NOT create a second observation.
@@ -144,7 +169,7 @@ The system SHALL store all new observations of the accepted currencies from one 
 - **THEN** none of that retrieval's observations are stored
 
 ### Requirement: Observations are append-only
-Stored observations SHALL NOT be updated or deleted by ingestion. A correction by BoI, meaning a new source timestamp for the same publication date, or the same source timestamp with a different source rate or unit, SHALL be stored as a new observation. The current observation for a pair SHALL be the one with the latest publication date, then the latest source timestamp, then the highest revision.
+Stored observations SHALL NOT be updated or deleted by ingestion. A correction by BoI, meaning a new source timestamp with new content (not a re-stamp) for the same publication date, or the same source timestamp with a different source rate or unit, SHALL be stored as a new observation. The current observation for a pair SHALL be the one with the latest publication date, then the latest source timestamp, then the highest revision.
 
 #### Scenario: Same-day correction
 - **GIVEN** a USD observation dated 2026-11-23 with source timestamp 13:21Z and rate 3.343 exists

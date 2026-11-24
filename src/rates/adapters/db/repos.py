@@ -264,6 +264,7 @@ def _to_observation(row: RowMapping) -> RateObservation:
         source_last_update=row["source_last_update"],
         retrieved_at=row["retrieved_at"],
         revision=row["revision"],
+        source_change=row["source_change"],
     )
 
 
@@ -279,6 +280,7 @@ def _from_observation(obs: RateObservation) -> dict[str, object]:
         "source_last_update": obs.source_last_update,
         "retrieved_at": obs.retrieved_at,
         "revision": obs.revision,
+        "source_change": obs.source_change,
     }
 
 

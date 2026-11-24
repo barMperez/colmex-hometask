@@ -261,3 +261,48 @@ async def test_no_calendar_warning_far_from_the_end(engine, caplog):
     with caplog.at_level(logging.WARNING, logger="rates.refresh.loop"):
         await loop.run_once()
     assert "calendar_expiring" not in caplog.text
+
+
+class PayloadSource:
+    def __init__(self, *payloads):
+        self._payloads = list(payloads)
+
+    async def fetch(self):
+        return self._payloads.pop(0)
+
+
+def restamped_monday(local: datetime) -> dict:
+    payload = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    for e in payload["exchangeRates"]:
+        e["lastUpdate"] = local.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return payload
+
+
+async def test_restamp_only_poll_is_a_success_and_pair_goes_overdue(engine, caplog):
+    """Regression: a re-stamp inside Tuesday's window used to make USD eligible again."""
+    def il(d, hh, mm=0):
+        return datetime(2026, 11, d, hh, mm, tzinfo=BOI_TIMEZONE).astimezone(UTC)
+
+    clock = FixedClock(il(23, 15, 25))
+    monday = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    source = PayloadSource(monday, restamped_monday(il(24, 17)))
+    loop = RefreshLoop(engine, IngestionService(engine, source, clock), clock, SETTINGS)
+
+    with caplog.at_level(logging.INFO):
+        assert await loop.run_once() is True
+        clock.set(il(24, 17, 5))
+        assert await loop.run_once() is True  # BoI answered; nothing new is not a failure
+
+    assert loop.consecutive_failures == 0
+    async with engine.connect() as conn:
+        status = await SqlRefreshStatusRepository(conn).get()
+    assert status.last_attempt_outcome == "success"
+    assert len(await snapshot_rows(engine)) == 3
+    assert "rates.restamp_ignored currency=USD" in caplog.text
+    assert pair_logs(caplog, "USD/ILS") == [
+        (
+            logging.ERROR,
+            "rates.pair_not_eligible pair=USD/ILS reason=PUBLICATION_OVERDUE "
+            "publication_date=2026-11-23 required=2026-11-24",
+        )
+    ]

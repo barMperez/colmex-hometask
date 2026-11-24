@@ -618,3 +618,34 @@ async def test_read_serves_same_timestamp_correction(engine, make_client):
     assert after["rateId"] != before["rateId"]
     assert after["source"]["lastUpdate"] == before["source"]["lastUpdate"]  # same BoI timestamp
     assert after["eligibility"]["status"] == "ELIGIBLE"
+
+
+# --- Regression: a BoI re-stamp is not a publication -------------------------
+
+class PayloadSource:
+    def __init__(self, payload) -> None:
+        self._payload = payload
+
+    async def fetch(self):
+        return self._payload
+
+
+async def test_restamped_rate_is_served_not_eligible_after_deadline(engine, make_client):
+    await ingest(engine)  # Monday 15:25
+    restamp = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    for e in restamp["exchangeRates"]:
+        e["lastUpdate"] = "2026-11-24T15:00:00Z"  # Tue 17:00 Israel, inside Tuesday's window
+    await IngestionService(engine, PayloadSource(restamp), FixedClock(il(2026, 11, 24, 17, 5))).run_once()
+    client = await make_client(engine, il(2026, 11, 24, 17, 10))
+
+    response = await get(client, "base=USD&quote=ILS")
+    ready = (await client.get("/health/ready")).json()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["publicationDate"] == "2026-11-23"
+    assert body["source"]["lastUpdate"] == "2026-11-23T13:21:10.710489Z"  # the real publication
+    assert body["eligibility"]["status"] == "NOT_ELIGIBLE"
+    assert body["eligibility"]["reason"] == "PUBLICATION_OVERDUE"
+    assert body["eligibility"]["requiredPublicationDate"] == "2026-11-24"
+    assert {p["pair"] for p in ready["notEligiblePairs"]} == {"USD/ILS", "EUR/ILS", "GBP/ILS"}

@@ -8,7 +8,7 @@ usable ``exchangeRates`` array (or a configuration error) rejects everything.
 import logging
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from typing import Any
@@ -43,6 +43,7 @@ class SourceRate:
     rate: Decimal
     unit: int
     last_update: datetime
+    change: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -60,9 +61,20 @@ class RejectedCurrency:
 
 
 @dataclass(frozen=True)
+class Restamp:
+    """BoI moved ``lastUpdate`` without publishing: same rate, unit and change."""
+
+    currency: str
+    last_update: datetime
+    current: RateObservation
+    """The stored observation the entry repeats; it stays current."""
+
+
+@dataclass(frozen=True)
 class IngestionBatch:
     accepted: list[RateObservation]
     rejected: list[RejectedCurrency]
+    restamped: list[Restamp] = field(default_factory=list)
 
 
 def parse_payload(payload: dict[str, Any]) -> Snapshot:
@@ -129,7 +141,40 @@ def _source_rate(key: str, entry: dict[str, Any]) -> SourceRate:
     if isinstance(unit, bool) or not isinstance(unit, int) or unit <= 0:
         raise SnapshotRejected(f"{key}: unit must be a positive integer, got {unit!r}")
 
-    return SourceRate(key, rate, unit, parse_last_update(entry.get("lastUpdate")))
+    change = entry.get("currentChange")
+    if isinstance(change, float):
+        raise TypeError("BoI payload must be parsed with parse_float=Decimal")
+    if change is not None:
+        if isinstance(change, bool) or not isinstance(change, (Decimal, int)):
+            raise SnapshotRejected(f"{key}: currentChange is not a number")
+        change = Decimal(change)
+        if not change.is_finite():
+            raise SnapshotRejected(f"{key}: currentChange must be finite, got {change}")
+        change = canonical_decimal(change)
+
+    return SourceRate(key, rate, unit, parse_last_update(entry.get("lastUpdate")), change)
+
+
+def is_restamp(incoming: SourceRate, current: RateObservation) -> bool:
+    """True when ``incoming`` repeats ``current`` under a different ``lastUpdate``.
+
+    A new ``lastUpdate`` alone is not a publication: BoI can re-stamp an entry. A
+    genuine publication changes the content: the rate, or at least ``currentChange``
+    (the change from the previous publication, which is 0 when the rate is unchanged).
+    So the same rate, unit and change means nothing was published. When either change
+    is unknown (BoI omitted it, or a row stored before it was recorded), a new
+    publication cannot be proven, so it is treated as a re-stamp (fail closed).
+
+    The same ``lastUpdate`` is not a re-stamp: that is a re-fetch or a same-timestamp
+    correction, handled by the store.
+    """
+    if incoming.last_update == current.source_last_update:
+        return False
+    if incoming.rate != current.source_rate or incoming.unit != current.source_unit:
+        return False
+    if incoming.change is None or current.source_change is None:
+        return True
+    return incoming.change == current.source_change
 
 
 def attribute_publication_date(
@@ -170,14 +215,15 @@ def build_ingestion(
     retrieved_at: datetime,
     calendar: CalendarView,
     policy: Policy,
-    stored_publication_dates: Mapping[tuple[str, str], date] | None = None,
+    current: Mapping[tuple[str, str], RateObservation] | None = None,
 ) -> IngestionBatch:
     """Validate each enabled currency independently and build its observation.
 
-    Each entry keeps its own ``lastUpdate``; its publication date comes from
-    ``attribute_publication_date`` (``stored_publication_dates`` maps
-    ``(base, quote)`` to the publication date of the pair's current observation).
-    A missing, duplicated or invalid entry (bad rate, unit or ``lastUpdate``, a
+    ``current`` maps ``(base, quote)`` to the pair's current stored observation.
+    An entry that only re-stamps it (``is_restamp``) is reported in ``restamped``
+    and produces no observation. Every other entry keeps its own ``lastUpdate``; its
+    publication date comes from ``attribute_publication_date``. A missing,
+    duplicated or invalid entry (bad rate, unit, change or ``lastUpdate``, a
     ``lastUpdate`` after ``today_local``, or an unattributable restatement) is
     rejected with a reason; the others are accepted.
 
@@ -191,8 +237,10 @@ def build_ingestion(
         if pair.quote != BOI_QUOTE_CURRENCY:
             raise SnapshotRejected(f"BoI only quotes against ILS; cannot serve {pair.base}/{pair.quote}")
 
+    current = current or {}
     accepted: list[RateObservation] = []
     rejected: list[RejectedCurrency] = []
+    restamped: list[Restamp] = []
     for pair in enabled_pairs:
         key = pair.source_key.upper()
         entry = snapshot.entries.get(key)
@@ -216,12 +264,16 @@ def build_ingestion(
                 )
             )
             continue
+        stored = current.get((pair.base, pair.quote))
+        if stored is not None and is_restamp(source, stored):
+            restamped.append(Restamp(key, source.last_update, stored))
+            continue
         try:
             published = attribute_publication_date(
                 source.last_update,
                 calendar,
                 policy,
-                (stored_publication_dates or {}).get((pair.base, pair.quote)),
+                stored.publication_date if stored is not None else None,
             )
         except PolicyNotEvaluable as exc:
             raise SnapshotRejected(f"Cannot attribute publication dates: {exc}") from exc
@@ -239,9 +291,10 @@ def build_ingestion(
                 publication_date=published,
                 source_last_update=source.last_update,
                 retrieved_at=retrieved_at,
+                source_change=source.change,
             )
         )
-    return IngestionBatch(accepted, rejected)
+    return IngestionBatch(accepted, rejected, restamped)
 
 
 def _strip_key(key: str, message: str) -> str:
