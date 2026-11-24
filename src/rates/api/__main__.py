@@ -1,0 +1,22 @@
+"""Entry point: ``python -m rates.api``. Workers scale freely; the API never writes rates."""
+
+import uvicorn
+
+from rates.settings import Settings
+
+
+def main() -> None:
+    settings = Settings()
+    uvicorn.run(
+        "rates.api.app:create_app",
+        factory=True,
+        host=settings.api_host,
+        port=settings.api_port,
+        workers=settings.api_workers,
+        log_level=settings.log_level.lower(),
+        proxy_headers=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

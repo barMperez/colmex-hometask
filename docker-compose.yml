@@ -1,0 +1,68 @@
+# One command: docker compose up --build
+# Startup order: postgres (healthy) -> migrate (completes) -> api + refresh.
+# Credentials below are for local development only.
+
+x-app: &app
+  build: .
+  image: rates-api:local
+  environment:
+    DATABASE_URL: postgresql+asyncpg://rates:rates@postgres:5432/rates
+    LOG_LEVEL: INFO
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rates
+      POSTGRES_PASSWORD: rates
+      POSTGRES_DB: rates
+    ports:
+      - "127.0.0.1:5433:5432" # host access for tests: TEST_DATABASE_URL=...@localhost:5433/rates
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rates -d rates"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["python", "-m", "rates.api"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rates:rates@postgres:5432/rates
+      LOG_LEVEL: INFO
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      API_WORKERS: "2"
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  refresh:
+    <<: *app
+    command: ["python", "-m", "rates.refresh"]
+    deploy:
+      replicas: 1 # the single writer of rate data; do not scale
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
