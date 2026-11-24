@@ -52,6 +52,8 @@ async def test_ingest_snapshot(engine):
     for e in entries:
         assert e["source_last_update"].startswith("2026-11-23T13:21:10.710489")
         assert e["publication_date"] == "2026-11-23"
+    assert audit["after"]["rejected"] == []
+    assert result.outcome == "success"
 
 
 async def test_reingest_is_idempotent_and_not_audited(engine):
@@ -101,12 +103,41 @@ async def test_single_currency_correction_leaves_other_pairs_untouched(engine):
     assert [e["pair"] for e in audits[-1]["after"]["observations"]] == ["USD/ILS"]
 
 
-@pytest.mark.parametrize("fixture", ["missing_gbp.json", "zero_rate.json", "future_last_update.json"])
-async def test_rejected_snapshot_stores_nothing(engine, fixture):
+async def test_missing_currency_stores_the_others_and_audits_rejection(engine):
+    result = await service(engine, "missing_gbp.json").run_once()
+
+    assert result.inserted == 2
+    assert result.outcome == "partial"
+    assert [(r.currency, r.reason) for r in result.rejected] == [("GBP", "missing")]
+    async with engine.connect() as conn:
+        stored = set((await conn.execute(select(rate_observations.c.base_currency))).scalars())
+        audit = (await conn.execute(select(audit_events))).mappings().one()
+    assert stored == {"USD", "EUR"}
+    assert sorted(e["pair"] for e in audit["after"]["observations"]) == ["EUR/ILS", "USD/ILS"]
+    assert audit["after"]["rejected"] == [{"currency": "GBP", "reason": "missing"}]
+
+
+async def test_invalid_rate_stores_the_others(engine):
+    result = await service(engine, "zero_rate.json").run_once()
+
+    assert result.outcome == "partial"
+    assert [r.currency for r in result.rejected] == ["EUR"]
+    async with engine.connect() as conn:
+        stored = set((await conn.execute(select(rate_observations.c.base_currency))).scalars())
+    assert stored == {"USD", "GBP"}
+
+
+@pytest.mark.parametrize("payload", ["future_last_update.json", "malformed"])
+async def test_nothing_valid_stores_nothing(engine, payload):
     await service(engine, "snapshot_2026-11-23.json").run_once()
 
+    class Malformed:
+        async def fetch(self):
+            return {"rates": []}
+
+    source = Malformed() if payload == "malformed" else FakeSource(payload)
     with pytest.raises(SnapshotRejected):
-        await service(engine, fixture).run_once()
+        await IngestionService(engine, source, FixedClock(NOW)).run_once()
 
     assert await count(engine, rate_observations) == 3
     assert await count(engine, audit_events) == 1

@@ -1,8 +1,11 @@
 """Parse, validate and normalise a BoI snapshot into rate observations.
 
-The snapshot is validated as a whole: any failure rejects everything.
+Each enabled currency is validated on its own: a missing or invalid currency is
+rejected with a reason while the others are accepted. Only a payload without a
+usable ``exchangeRates`` array (or a configuration error) rejects everything.
 """
 
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -16,7 +19,11 @@ from rates.domain.decimals import canonical_decimal
 from rates.domain.errors import SnapshotRejected
 from rates.domain.models import BOI_TIMEZONE, CurrencyPair, RateObservation
 
+log = logging.getLogger(__name__)
+
 BOI_QUOTE_CURRENCY = "ILS"
+REASON_MISSING = "missing"
+REASON_DUPLICATE = "duplicate"
 
 _TIMESTAMP = re.compile(
     r"^(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
@@ -37,6 +44,20 @@ class SourceRate:
 class Snapshot:
     entries: dict[str, dict[str, Any]]
     """Raw entries keyed by currency; only entries for enabled pairs are validated."""
+    duplicates: frozenset[str] = frozenset()
+    """Currency keys that appeared more than once (we cannot tell which is right)."""
+
+
+@dataclass(frozen=True)
+class RejectedCurrency:
+    currency: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class IngestionBatch:
+    accepted: list[RateObservation]
+    rejected: list[RejectedCurrency]
 
 
 def parse_payload(payload: dict[str, Any]) -> Snapshot:
@@ -44,14 +65,18 @@ def parse_payload(payload: dict[str, Any]) -> Snapshot:
     if not isinstance(rates, list):
         raise SnapshotRejected("Missing 'exchangeRates' array")
     entries: dict[str, dict[str, Any]] = {}
+    duplicates: set[str] = set()
     for item in rates:
         if not isinstance(item, dict) or not isinstance(item.get("key"), str):
-            raise SnapshotRejected("Malformed 'exchangeRates' entry")
+            # Cannot belong to any currency. If it was "really" an enabled one, that
+            # currency shows up as missing and is rejected on its own.
+            log.warning("boi.entry_skipped reason=no_string_key item=%r", item)
+            continue
         key = item["key"].upper()
         if key in entries:
-            raise SnapshotRejected(f"Duplicate entry for {key}")
+            duplicates.add(key)
         entries[key] = item
-    return Snapshot(entries)
+    return Snapshot(entries, frozenset(duplicates))
 
 
 def parse_last_update(value: object) -> datetime:
@@ -102,36 +127,53 @@ def _source_rate(key: str, entry: dict[str, Any]) -> SourceRate:
     return SourceRate(key, rate, unit, parse_last_update(entry.get("lastUpdate")))
 
 
-def build_observations(
+def build_ingestion(
     snapshot: Snapshot,
     enabled_pairs: Sequence[CurrencyPair],
     today_local: date,
     retrieved_at: datetime,
-) -> list[RateObservation]:
-    """Validate the snapshot for the enabled pairs and build observations.
+) -> IngestionBatch:
+    """Validate each enabled currency independently and build its observation.
 
-    Each entry keeps its own ``lastUpdate`` and publication date, so BoI may correct a
-    single currency. Raises ``SnapshotRejected`` if any enabled pair is missing or
-    invalid, or if any enabled entry's publication date is in the future.
+    Each entry keeps its own ``lastUpdate`` and publication date. A missing,
+    duplicated or invalid entry (bad rate, unit or ``lastUpdate``, or a publication
+    date after ``today_local``) is rejected with a reason; the others are accepted.
+
+    Raises ``SnapshotRejected`` only for configuration errors: no enabled pairs, or a
+    pair that BoI cannot serve (quote other than ILS).
     """
     if not enabled_pairs:
         raise SnapshotRejected("No enabled currency pairs configured")
-
-    observations: list[RateObservation] = []
     for pair in enabled_pairs:
         if pair.quote != BOI_QUOTE_CURRENCY:
             raise SnapshotRejected(f"BoI only quotes against ILS; cannot serve {pair.base}/{pair.quote}")
-        entry = snapshot.entries.get(pair.source_key.upper())
+
+    accepted: list[RateObservation] = []
+    rejected: list[RejectedCurrency] = []
+    for pair in enabled_pairs:
+        key = pair.source_key.upper()
+        entry = snapshot.entries.get(key)
         if entry is None:
-            raise SnapshotRejected(f"Snapshot is missing enabled currency {pair.source_key}")
-        source = _source_rate(pair.source_key, entry)
+            rejected.append(RejectedCurrency(key, REASON_MISSING))
+            continue
+        if key in snapshot.duplicates:
+            rejected.append(RejectedCurrency(key, REASON_DUPLICATE))
+            continue
+        try:
+            source = _source_rate(key, entry)
+        except SnapshotRejected as exc:
+            rejected.append(RejectedCurrency(key, _strip_key(key, str(exc))))
+            continue
         published = publication_date_of(source.last_update)
         if published > today_local:
-            raise SnapshotRejected(
-                f"{pair.source_key}: publication date {published} is after today "
-                f"({today_local}) in Asia/Jerusalem"
+            rejected.append(
+                RejectedCurrency(
+                    key,
+                    f"publication date {published} is after today ({today_local}) in Asia/Jerusalem",
+                )
             )
-        observations.append(
+            continue
+        accepted.append(
             RateObservation(
                 id=uuid4(),
                 base_currency=pair.base,
@@ -144,4 +186,9 @@ def build_observations(
                 retrieved_at=retrieved_at,
             )
         )
-    return observations
+    return IngestionBatch(accepted, rejected)
+
+
+def _strip_key(key: str, message: str) -> str:
+    prefix = f"{key}: "
+    return message[len(prefix):] if message.startswith(prefix) else message

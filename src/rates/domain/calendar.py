@@ -23,6 +23,19 @@ class CalendarView:
             )
         return day.weekday() < 5 and day not in self.non_publication_days
 
+    def coverage_end(self, today: date) -> date | None:
+        """31 December of the last year in the unbroken run of loaded years from ``today``.
+
+        None when ``today``'s own year is not loaded (the policy is already not
+        evaluable). A gap ends coverage: 2026 + 2028 loaded means 2026-12-31.
+        """
+        if today.year not in self.covered_years:
+            return None
+        year = today.year
+        while year + 1 in self.covered_years:
+            year += 1
+        return date(year, 12, 31)
+
 
 def publication_deadline(day: date, policy: Policy) -> datetime:
     """Expected publication time for ``day`` plus grace, as a UTC instant.

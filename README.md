@@ -29,6 +29,14 @@ open http://localhost:8000/docs        # OpenAPI / Swagger UI
 
 Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes are case-insensitive.
 
+**Converting a shekel deposit to dollars.** Rates are served in one direction only: `1 base = rate quote`, e.g. `1 USD = 3.343 ILS`. To convert `X` ILS into USD, request `base=USD&quote=ILS` and divide:
+
+```
+10,000 ILS / 3.343 = 2,991.3251... USD   ->  2,991.33 (half-up to cents)  or  2,991.32 (rounded down)
+```
+
+Which rounding applies is the consuming system's money rule, which is why this service returns the exact decimal and never rounds. `base=ILS&quote=USD` returns 422 `UNSUPPORTED_CURRENCY_PAIR` by design.
+
 **Eligible rate** (Tue 24/11 10:00 Israel time; Monday's rate is the latest expected):
 
 ```json
@@ -110,7 +118,7 @@ Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes 
 
             +---------------------- refresh process (exactly 1, only writer) --------------+
             |  RefreshLoop --> IngestionService --> BoiClient --> boi.org.il/PublicApi     |
-            |                        |  validate whole snapshot, normalise units           |
+            |                        |  validate each currency, normalise units            |
             |                        +--> ONE transaction: insert observations + audit     |
             +------------------------------------------------------------------------------+
 
@@ -124,7 +132,7 @@ Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes 
 
 **Read flow** (`GET /api/v1/exchange-rates`): validate codes (400), then check the pair is enabled (422), then load the active policy and calendar (503 if missing), then load the latest observation (404 if none), then `evaluate(...)` and return 200. **BoI is never called on the read path**, so BoI outages don't affect reads; they only stop new data arriving.
 
-**Refresh flow**: every 5 min on business days 12:00–18:00 Israel time, hourly otherwise. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates the **whole** snapshot: all enabled pairs present, rate > 0, unit is a positive integer, and no publication date in the future. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. Then it inserts in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and writes one audit event only if anything new was stored. A failed or rejected fetch changes nothing.
+**Refresh flow**: every **1 min** on business days from the expected publication time until 30 min after the deadline (15:15–16:30 Mon–Thu, 12:15–13:30 Fri, taken from the active policy), every 5 min otherwise between 12:00 and 18:00, and hourly outside that window, at weekends and on holidays. The dense window costs about 60 extra BoI requests per business day (75 polls instead of 15), and it means a late BoI publication reaches us within a minute instead of up to five. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates **each enabled currency on its own**: present, rate > 0, unit is a positive integer, a parseable `lastUpdate`, and no publication date in the future. A missing or invalid currency is rejected with its reason and logged at error level, while the valid currencies are still stored, so a GBP problem never stops USD. Such an attempt is recorded as `partial`, which doesn't count as a success. Only a payload without an `exchangeRates` array is rejected as a whole. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. The accepted currencies are inserted in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and one audit event is written only if anything new was stored; it lists any rejected currencies. A failed fetch changes nothing.
 
 **Code layout**
 
@@ -208,7 +216,7 @@ The full design record, including the alternatives considered, is in [`openspec/
 | 5 | **Pure `evaluate()` function** with an injected clock | All financial logic is unit-testable as a table; no I/O, no hidden `now()` | n/a |
 | 6 | **Two processes from one codebase**: API (N workers, read-only) + refresh (exactly 1 writer) | One writer by construction, no distributed locking; BoI latency never sits on the read path | Two things to run (one `docker compose up`) |
 | 7 | **Append-only observations, idempotent on `(pair, BoI lastUpdate)`** | Same-day BoI corrections are kept as history; duplicate or concurrent refreshes are harmless | Storage grows slowly (3 rows per publication) |
-| 8 | **Whole-snapshot validation** | A partial publication must never look like a complete one | One bad currency blocks all updates (visible in logs, then `NOT_ELIGIBLE` after the deadline) |
+| 8 | **Per-currency validation** (replaced whole-snapshot validation) | Each pair's eligibility is judged on its own publication date, so a bad GBP entry has no reason to block USD deposits | A currency BoI stops sending leaves every attempt `partial`: `lastSuccessfulIngestionAt` freezes until the pair is disabled. That's intentional, so the problem gets alerted on |
 | 9 | **Exact decimals end to end**: `parse_float=Decimal`, `TEXT`/`NUMERIC` storage, JSON strings | Binary floats can't represent rates exactly | Consumers parse a string, not a JSON number |
 | 10 | **SQLAlchemy Core + Alembic; Postgres in compose, SQLite locally/tests** | One-command realistic setup, plus zero-setup dev; all dialect quirks in `adapters/db/types.py`; the same test suite runs on both | Hand-written migrations must work on both dialects |
 | 11 | **Policy and calendar read on every request**, no cache | A few dozen rows; operator changes apply immediately; nothing to invalidate across workers | A few extra cheap queries per request |
@@ -218,20 +226,47 @@ The full design record, including the alternatives considered, is in [`openspec/
 ## 6. Assumptions and limitations
 
 - **Grace 45 minutes and max age 7 days are assumptions, not BoI rules.** BoI says rates are published "soon after 15:15" but "the time is not fixed". Observed publications are a few minutes after 15:15. Both values live in the versioned `policies` table (v1).
-- **The BoI calendar must be loaded every year.** Seeded for 2026–2027 from BoI's official PDF. From 2028-01-01 the API returns `503 POLICY_NOT_EVALUABLE` (by design) until a migration adds the 2028 list and a `calendar_coverage` row. Walking back from early January also needs the previous year. A calendar that leaves no business day within the 7-day cap is also treated as bad data: reads of a recent rate return 503 `POLICY_NOT_EVALUABLE` (logged at error level) until the calendar is corrected.
+- **The BoI calendar must be loaded every year.** Seeded for 2026–2027 from BoI's official PDF. From 2028-01-01 the API returns `503 POLICY_NOT_EVALUABLE` (by design) until a migration adds the 2028 list and a `calendar_coverage` row. That cliff is announced in advance: `/health/ready` reports `calendarCoverageEndsOn` (2027-12-31 today) and sets `calendarExpiryWarning: true` within `CALENDAR_WARNING_DAYS` (default **60**) of it, and the refresh process logs `rates.calendar_expiring ends_on=... days_left=...` once a day while the warning is on. When it fires, add a migration with the next year's BoI non-publication list and its `calendar_coverage` row. Walking back from early January also needs the previous year. A calendar that leaves no business day within the 7-day cap is also treated as bad data: reads of a recent rate return 503 `POLICY_NOT_EVALUABLE` (logged at error level) until the calendar is corrected.
 - **Holiday eves with an early (12:15) publication are not modelled.** The calendar only lists days with *no* publication. On a Mon–Thu holiday eve the previous rate stays eligible until 16:00 instead of 13:00. The refresh process still ingests the new rate as soon as it appears.
-- **Ingestion lag.** Between BoI publishing and our next poll (≤ 5 min in the window) the API serves the previous rate, which is still eligible until the deadline.
-- **BoI may change its payload shape.** Whole-snapshot validation rejects anything unexpected, the last good data is kept, and the failure is logged. Reads turn `NOT_ELIGIBLE` after the next deadline, which is the visible signal.
+- **Ingestion lag.** Between BoI publishing and our next poll (≤ 1 min in the dense window around the deadline, ≤ 5 min elsewhere in the publication window) the API serves the previous rate, which is still eligible until the deadline.
+- **BoI may change its payload shape.** Validation rejects anything unexpected (per currency, or the whole payload if `exchangeRates` itself is missing), the last good data is kept, and the failure is logged. Reads turn `NOT_ELIGIBLE` after the next deadline, which is the visible signal.
 - **SQLite allows one writer.** That matches the design (only the refresh process writes) and WAL keeps readers concurrent. Postgres is the compose default.
 - **`publicationDate` is derived** from BoI's `lastUpdate` timestamp converted to Israel time. The API has no explicit date field.
 - **Representative rates are not trade prices** (see §1).
 - **No stated load or SLO requirements** were given. Reads are a few indexed queries over a tiny dataset; the API scales horizontally (`API_WORKERS`, more replicas). The refresh process must stay single-instance (correctness doesn't depend on it, efficiency does).
 - **Security:** assumed internal network use. There is no authentication on the read API. The operator action is a script with DB access, not an HTTP endpoint. Compose credentials are for local development only.
-- **Health:** `/health/live` checks the process. `/health/ready` checks the database and reports two times:
+- **Health:** `/health/live` checks the process. `/health/ready` checks the database (200, or 503 `STORAGE_UNAVAILABLE`) and reports what an operator needs to keep deposits flowing:
   - `latestRetrievedAt`: when the newest stored rate was fetched.
-  - `lastSuccessfulIngestionAt`: when the refresh process last completed a successful poll, including polls that found nothing new. Null until the first success.
+  - `lastSuccessfulIngestionAt`: when the refresh process last completed a successful poll, including polls that found nothing new. Null until the first success. A `partial` poll (some currency rejected) does not count.
+  - `notEligiblePairs`: every enabled pair a consumer can't use right now, with its reason (`PUBLICATION_OVERDUE`, `MAX_AGE_EXCEEDED`, `INVALID_PUBLICATION_DATE`, `RATE_NOT_FOUND` or `POLICY_NOT_EVALUABLE`) and the publication date of its current rate.
 
-  The refresh process records each attempt in a one-row `refresh_status` table, so the API can report this without talking to the refresh process. Freshness is reported per read via `eligibility`, not via readiness, so an old rate or a stalled refresh doesn't take the API out of rotation: alert on `lastSuccessfulIngestionAt` instead.
+  None of these change the readiness status: an old rate or a stalled refresh must not take the API out of rotation. They are the signals to alert on. The refresh process records each attempt in a one-row `refresh_status` table, so the API can report this without talking to the refresh process.
+
+  Example, Tue 24/11 16:30, with BoI's Tuesday USD rate not yet received:
+
+  ```json
+  {
+    "status": "ready",
+    "database": "ok",
+    "latestRetrievedAt": "2026-11-24T13:25:00Z",
+    "lastSuccessfulIngestionAt": "2026-11-24T14:29:41Z",
+    "notEligiblePairs": [
+      {"pair": "USD/ILS", "reason": "PUBLICATION_OVERDUE", "publicationDate": "2026-11-23"}
+    ],
+    "calendarCoverageEndsOn": "2027-12-31",
+    "calendarExpiryWarning": false
+  }
+  ```
+
+  **What to alert on** (any of these means deposits are, or soon will be, blocked):
+
+  | Signal | Where | Meaning |
+  |---|---|---|
+  | `notEligiblePairs` not empty | `/health/ready` | A pair is unusable right now (e.g. BoI skipped a day; see §4 operator action) |
+  | `rates.pair_not_eligible pair=... reason=...` (ERROR) | refresh logs | Logged once when a pair becomes unusable; `rates.pair_eligible` (INFO) when it recovers. Fires even when no one is calling the API |
+  | `refresh.currency_rejected currency=... reason=...` (ERROR) | refresh logs | BoI sent a missing or invalid entry; the other currencies were still stored |
+  | `lastSuccessfulIngestionAt` older than ~15 min in the dense window | `/health/ready` | Refresh is failing or every attempt is `partial` |
+  | `calendarExpiryWarning: true` / `rates.calendar_expiring` (WARNING, daily) | `/health/ready`, refresh logs | The BoI calendar runs out soon: every read will return 503 after `calendarCoverageEndsOn` |
 
 ## 7. Running without Docker, tests, failure simulation
 
@@ -302,6 +337,22 @@ refresh   | refresh.attempt outcome=boi_unavailable consecutive_failures=1 last_
 
 $ curl localhost:8000/health/ready     # unchanged: a failure never moves the last success
 {"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T11:45:58.922261Z","lastSuccessfulIngestionAt":"2026-11-24T12:53:12.084627Z"}
+```
+
+**Deposit-availability hardening** (redeploy at Tue 24/11 15:56 Israel time, inside the dense window 15:15–16:30; BoI had published today's rates at 15:21):
+
+```text
+refresh-1 | 13:56:01 refresh.attempt outcome=success inserted=0 latest_publication_date=2026-11-24 ...
+refresh-1 | 13:57:01 refresh.attempt outcome=success inserted=0 latest_publication_date=2026-11-24 ...
+refresh-1 | 13:58:01 refresh.attempt outcome=success inserted=0 latest_publication_date=2026-11-24 ...   # 60 s apart (UTC times)
+
+$ curl localhost:8000/health/ready
+{"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T13:23:34.169839Z","lastSuccessfulIngestionAt":"2026-11-24T13:56:01.881867Z","notEligiblePairs":[],"calendarCoverageEndsOn":"2027-12-31","calendarExpiryWarning":false}
+
+$ curl "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"   # rate 3.345, publicationDate 2026-11-24, ELIGIBLE
+
+# simulated Postgres crash (pg_ctl stop -m immediate inside the container):
+# Docker restarts it (RestartCount 1) and the read above returns 200 again with no manual action
 ```
 
 ## 8. Out of scope and possible extensions

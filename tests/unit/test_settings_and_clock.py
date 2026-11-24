@@ -23,6 +23,9 @@ def test_settings_defaults(monkeypatch):
     settings = Settings(_env_file=None)
     assert settings.database_url.startswith("sqlite+aiosqlite://")
     assert settings.boi_max_attempts == 3
+    assert settings.refresh_dense_interval_seconds == 60
+    assert settings.refresh_dense_tail_minutes == 30
+    assert settings.calendar_warning_days == 60
 
 
 def test_fixed_clock_returns_aware_utc():

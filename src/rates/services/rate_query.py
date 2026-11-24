@@ -6,7 +6,7 @@ contacted on this path.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -22,7 +22,8 @@ from rates.adapters.db.repos import (
 from rates.clock import Clock
 from rates.domain.eligibility import evaluate
 from rates.domain.errors import PolicyNotEvaluable, RateNotFound, StorageUnavailable, UnsupportedPair
-from rates.domain.models import Eligibility, RateObservation
+from rates.domain.models import BOI_TIMEZONE, Eligibility, RateObservation
+from rates.services.pair_health import PairAssessment, assess_pairs, calendar_expiry
 
 STORAGE_ERRORS = (OperationalError, InterfaceError, PoolTimeoutError, OSError)
 
@@ -37,12 +38,16 @@ class RateView:
 class Readiness:
     latest_retrieved_at: datetime | None
     last_successful_ingestion_at: datetime | None
+    not_eligible_pairs: list[PairAssessment]
+    calendar_coverage_ends_on: date | None
+    calendar_expiry_warning: bool
 
 
 class RateQueryService:
-    def __init__(self, engine: AsyncEngine, clock: Clock) -> None:
+    def __init__(self, engine: AsyncEngine, clock: Clock, calendar_warning_days: int = 60) -> None:
         self._engine = engine
         self._clock = clock
+        self._calendar_warning_days = calendar_warning_days
 
     async def get_rate(self, base: str, quote: str) -> RateView:
         try:
@@ -66,6 +71,17 @@ class RateQueryService:
             async with self._engine.connect() as conn:
                 latest = await SqlRateRepository(conn).latest_retrieved_at()
                 status = await SqlRefreshStatusRepository(conn).get()
-            return Readiness(latest, status.last_success_at)
+                now = self._clock.now()
+                health = await assess_pairs(conn, now)
+            expiry = calendar_expiry(
+                health.calendar, now.astimezone(BOI_TIMEZONE).date(), self._calendar_warning_days
+            )
+            return Readiness(
+                latest,
+                status.last_success_at,
+                health.not_eligible,
+                expiry.ends_on,
+                expiry.warning,
+            )
         except STORAGE_ERRORS as exc:
             raise StorageUnavailable("Rate storage is unavailable") from exc

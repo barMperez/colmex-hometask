@@ -248,12 +248,66 @@ async def test_readiness_reports_last_successful_ingestion(engine, make_client):
     assert ready["latestRetrievedAt"] == "2026-11-23T13:25:00Z"
 
 
+async def test_readiness_lists_only_the_overdue_pair(engine, make_client):
+    await ingest(engine, "usd_late_2026-11-24.json", at=il(2026, 11, 24, 15, 25))
+    client = await make_client(engine, il(2026, 11, 24, 16, 30))  # after Tuesday's 16:00 deadline
+
+    ready = await client.get("/health/ready")
+
+    assert ready.status_code == 200
+    assert ready.json()["notEligiblePairs"] == [
+        {"pair": "USD/ILS", "reason": "PUBLICATION_OVERDUE", "publicationDate": "2026-11-23"}
+    ]
+
+
+async def test_readiness_all_pairs_eligible(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+    assert (await client.get("/health/ready")).json()["notEligiblePairs"] == []
+
+
+async def test_readiness_fresh_install_lists_rate_not_found(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+    pairs = (await client.get("/health/ready")).json()["notEligiblePairs"]
+    assert sorted(p["pair"] for p in pairs) == ["EUR/ILS", "GBP/ILS", "USD/ILS"]
+    assert {(p["reason"], p["publicationDate"]) for p in pairs} == {("RATE_NOT_FOUND", None)}
+
+
+async def test_readiness_policy_not_evaluable_lists_every_pair(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2028, 1, 4, 10, 0))  # no 2028 calendar
+
+    ready = await client.get("/health/ready")
+
+    assert ready.status_code == 200
+    pairs = ready.json()["notEligiblePairs"]
+    assert len(pairs) == 3
+    assert {p["reason"] for p in pairs} == {"POLICY_NOT_EVALUABLE"}
+
+
+@pytest.mark.parametrize(
+    ("now", "ends_on", "warning"),
+    [
+        (il(2026, 11, 24, 10, 0), "2027-12-31", False),
+        (il(2027, 11, 2, 10, 0), "2027-12-31", True),   # 59 days left, threshold 60
+        (il(2028, 1, 4, 10, 0), None, True),            # current year not loaded
+    ],
+)
+async def test_readiness_reports_calendar_expiry(engine, make_client, now, ends_on, warning):
+    client = await make_client(engine, now)
+    body = (await client.get("/health/ready")).json()
+    assert body["calendarCoverageEndsOn"] == ends_on
+    assert body["calendarExpiryWarning"] is warning
+
+
 async def test_openapi_documents_readiness_fields(engine, make_client):
     client = await make_client(engine, il(2026, 11, 24, 10, 0))
     spec = (await client.get("/openapi.json")).json()
     props = spec["components"]["schemas"]["ReadinessOut"]["properties"]
     assert "lastSuccessfulIngestionAt" in props
     assert props["lastSuccessfulIngestionAt"]["description"]
+    assert props["notEligiblePairs"]["description"]
+    assert props["calendarExpiryWarning"]["description"]
 
 
 async def test_openapi_marks_eligibility_required(engine, make_client):

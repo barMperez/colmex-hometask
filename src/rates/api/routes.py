@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request
 
 from rates.api.problems import problem_openapi
-from rates.api.schemas import ExchangeRateOut, ReadinessOut
+from rates.api.schemas import ExchangeRateOut, NotEligiblePairOut, ReadinessOut
 from rates.services.rate_query import RateQueryService
 
 CURRENCY_PATTERN = r"^[A-Za-z]{3}$"
@@ -29,7 +29,11 @@ CurrencyCode = Annotated[
         "Returns the latest ingested Bank of Israel representative rate with its publication "
         "date and an eligibility assessment. **Consumers must check `eligibility.status` == "
         "`ELIGIBLE`** before using the rate: an out-of-date rate is returned with status 200 "
-        "and `NOT_ELIGIBLE`. Rates are decimal strings. 1 `base` = `rate` `quote`."
+        "and `NOT_ELIGIBLE`. Rates are decimal strings. 1 `base` = `rate` `quote`.\n\n"
+        "**Direction.** Only `base`=USD/EUR/GBP with `quote`=ILS is served; `ILS/USD` returns 422 "
+        "by design. To convert a shekel amount into dollars, divide by the USD/ILS rate: "
+        "10,000 ILS / 3.343 = 2,991.3251... USD (2,991.33 half-up, 2,991.32 rounded down). "
+        "Rounding is the consumer's money rule; this API never rounds."
     ),
     responses={
         400: problem_openapi("INVALID_REQUEST"),
@@ -64,4 +68,10 @@ async def ready(service: Annotated[RateQueryService, Depends(get_service)]) -> R
     return ReadinessOut(
         latest_retrieved_at=readiness.latest_retrieved_at,
         last_successful_ingestion_at=readiness.last_successful_ingestion_at,
+        not_eligible_pairs=[
+            NotEligiblePairOut(pair=p.pair, reason=p.reason, publication_date=p.publication_date)
+            for p in readiness.not_eligible_pairs
+        ],
+        calendar_coverage_ends_on=readiness.calendar_coverage_ends_on,
+        calendar_expiry_warning=readiness.calendar_expiry_warning,
     )

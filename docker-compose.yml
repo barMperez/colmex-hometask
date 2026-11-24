@@ -13,6 +13,7 @@ x-app: &app
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped # a crash must not take the service down until someone notices
     environment:
       POSTGRES_USER: rates
       POSTGRES_PASSWORD: rates

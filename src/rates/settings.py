@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     refresh_off_window_interval_seconds: int = Field(default=3600, ge=1)
     refresh_window_start: time = time(12, 0)
     refresh_window_end: time = time(18, 0)
+    refresh_dense_interval_seconds: int = Field(default=60, ge=1)
+    """Interval from the expected publication time until the deadline plus the tail."""
+    refresh_dense_tail_minutes: int = Field(default=30, ge=0)
+
+    calendar_warning_days: int = Field(default=60, ge=0)
+    """Warn when the loaded BoI calendar ends within this many days."""
 
     api_host: str = "127.0.0.1"
     api_port: int = 8000

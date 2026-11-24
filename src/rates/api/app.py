@@ -25,7 +25,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         eng = engine or create_engine(settings.database_url)
-        app.state.rate_query = RateQueryService(eng, clock or SystemClock())
+        app.state.rate_query = RateQueryService(
+            eng, clock or SystemClock(), calendar_warning_days=settings.calendar_warning_days
+        )
         try:
             yield
         finally:

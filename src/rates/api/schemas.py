@@ -93,6 +93,20 @@ class ExchangeRateOut(CamelModel):
         )
 
 
+class NotEligiblePairOut(CamelModel):
+    pair: str = Field(description="Currency pair, `BASE/QUOTE`.", examples=["USD/ILS"])
+    reason: str = Field(
+        description=(
+            "Why the pair is not eligible now: an eligibility reason "
+            "(`PUBLICATION_OVERDUE`, `MAX_AGE_EXCEEDED`, `INVALID_PUBLICATION_DATE`), "
+            "`RATE_NOT_FOUND` (nothing ingested yet) or `POLICY_NOT_EVALUABLE`."
+        )
+    )
+    publication_date: date | None = Field(
+        description="Publication date of the pair's current observation, if any."
+    )
+
+
 class ReadinessOut(CamelModel):
     status: Literal["ready"] = "ready"
     database: Literal["ok"] = "ok"
@@ -103,5 +117,24 @@ class ReadinessOut(CamelModel):
         description=(
             "When the refresh process last completed a successful ingestion, including "
             "polls that found nothing new. Null until the first success."
+        )
+    )
+    not_eligible_pairs: list[NotEligiblePairOut] = Field(
+        description=(
+            "Enabled pairs whose current rate is not ELIGIBLE right now. Empty when all are. "
+            "Informational: it does not change the readiness status; alert on it."
+        )
+    )
+    calendar_coverage_ends_on: date | None = Field(
+        description=(
+            "Last date covered by the loaded BoI non-publication calendar (31 December of the "
+            "last year in the unbroken run from the current year). Null when the current year "
+            "is not loaded. After this date every read returns 503 POLICY_NOT_EVALUABLE."
+        )
+    )
+    calendar_expiry_warning: bool = Field(
+        description=(
+            "True when the calendar ends within CALENDAR_WARNING_DAYS (default 60) or is "
+            "already missing: load the next year's BoI list."
         )
     )

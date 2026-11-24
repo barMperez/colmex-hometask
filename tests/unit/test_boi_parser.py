@@ -5,7 +5,9 @@ from decimal import Decimal
 import pytest
 
 from rates.adapters.boi.parser import (
-    build_observations,
+    REASON_DUPLICATE,
+    REASON_MISSING,
+    build_ingestion,
     normalise,
     parse_last_update,
     parse_payload,
@@ -24,8 +26,23 @@ def load(name: str) -> dict:
     return json.loads(boi_fixture(name), parse_float=Decimal)
 
 
+def batch_of(payload: dict, pairs=PAIRS, today=TODAY):
+    return build_ingestion(parse_payload(payload), pairs, today, RETRIEVED)
+
+
 def build(name: str, pairs=PAIRS, today=TODAY):
-    return build_observations(parse_payload(load(name)), pairs, today, RETRIEVED)
+    """Accepted observations of a fixture; asserts nothing was rejected."""
+    result = batch_of(load(name), pairs, today)
+    assert result.rejected == []
+    return result.accepted
+
+
+def accepted_codes(result) -> set[str]:
+    return {o.base_currency for o in result.accepted}
+
+
+def rejected_map(result) -> dict[str, str]:
+    return {r.currency: r.reason for r in result.rejected}
 
 
 def test_real_snapshot_builds_observations():
@@ -69,12 +86,32 @@ def test_publication_date_uses_israel_date():
     assert publication_date_of(parse_last_update("2026-11-23T22:30:00Z")) == date(2026, 11, 24)
 
 
-@pytest.mark.parametrize(
-    "fixture", ["missing_gbp.json", "zero_rate.json", "future_last_update.json"]
-)
-def test_invalid_snapshots_rejected(fixture):
-    with pytest.raises(SnapshotRejected):
-        build(fixture)
+# --- Per-currency validation ------------------------------------------------
+
+def test_missing_currency_rejected_alone():
+    result = batch_of(load("missing_gbp.json"))
+    assert accepted_codes(result) == {"USD", "EUR"}
+    assert rejected_map(result) == {"GBP": REASON_MISSING}
+
+
+def test_non_positive_rate_rejected_alone():
+    result = batch_of(load("zero_rate.json"))
+    assert accepted_codes(result) == {"USD", "GBP"}
+    assert "must be > 0" in rejected_map(result)["EUR"]
+
+
+def test_future_dated_entry_rejected_alone():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][1]["lastUpdate"] = "2026-11-25T10:00:00Z"  # GBP only
+    result = batch_of(payload)
+    assert accepted_codes(result) == {"USD", "EUR"}
+    assert "after today" in rejected_map(result)["GBP"]
+
+
+def test_every_currency_invalid():
+    result = batch_of(load("future_last_update.json"))  # all dated 2026-11-25
+    assert result.accepted == []
+    assert set(rejected_map(result)) == {"USD", "EUR", "GBP"}
 
 
 def test_future_publication_date_rejected_relative_to_today():
@@ -82,26 +119,51 @@ def test_future_publication_date_rejected_relative_to_today():
     assert len(build("future_last_update.json", today=date(2026, 11, 25))) == 3
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {},
-        {"exchangeRates": "nope"},
-        {"exchangeRates": [{"currentExchangeRate": 3}]},
-    ],
-)
-def test_structurally_malformed_payload_rejected(payload):
-    with pytest.raises(SnapshotRejected):
-        build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+def test_bad_last_update_rejected_alone():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][0]["lastUpdate"] = "yesterday"  # USD
+    result = batch_of(payload)
+    assert accepted_codes(result) == {"EUR", "GBP"}
+    assert "lastUpdate" in rejected_map(result)["USD"]
+
+
+@pytest.mark.parametrize("unit", [0, -1, "1", True, Decimal("1.5")])
+def test_invalid_unit_rejected_alone(unit):
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][0]["unit"] = unit  # USD
+    result = batch_of(payload)
+    assert accepted_codes(result) == {"EUR", "GBP"}
+    assert "unit" in rejected_map(result)["USD"]
+
+
+def test_duplicate_enabled_currency_rejected_alone():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"].append(dict(payload["exchangeRates"][0], currentExchangeRate=Decimal("9")))
+    result = batch_of(payload)
+    assert accepted_codes(result) == {"EUR", "GBP"}
+    assert rejected_map(result) == {"USD": REASON_DUPLICATE}
+
+
+def test_keyless_item_is_skipped(caplog):
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"].append({"currentExchangeRate": Decimal("3")})
+    with caplog.at_level("WARNING", logger="rates.adapters.boi.parser"):
+        assert len(build_ingestion(parse_payload(payload), PAIRS, TODAY, RETRIEVED).accepted) == 3
+    assert "boi.entry_skipped" in caplog.text
+
+
+def test_disabled_currencies_are_ignored_even_if_invalid():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][2]["lastUpdate"] = "2026-11-25T10:00:00Z"  # JPY: not enabled
+    payload["exchangeRates"][4]["currentExchangeRate"] = Decimal("0")  # LBP: not enabled
+    result = batch_of(payload)
+    assert len(result.accepted) == 3 and result.rejected == []
 
 
 def test_differing_last_update_accepted_per_entry():
     payload = load("snapshot_2026-11-23.json")
     payload["exchangeRates"][0]["lastUpdate"] = "2026-11-23T14:05:00Z"  # USD only
-    observations = {
-        o.base_currency: o
-        for o in build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
-    }
+    observations = {o.base_currency: o for o in batch_of(payload).accepted}
 
     assert observations["USD"].source_last_update == datetime(2026, 11, 23, 14, 5, tzinfo=UTC)
     assert observations["EUR"].source_last_update == datetime(
@@ -110,28 +172,25 @@ def test_differing_last_update_accepted_per_entry():
     assert {o.publication_date for o in observations.values()} == {date(2026, 11, 23)}
 
 
-def test_single_future_dated_entry_rejects_snapshot():
-    payload = load("snapshot_2026-11-23.json")
-    payload["exchangeRates"][1]["lastUpdate"] = "2026-11-25T10:00:00Z"  # GBP only
-    with pytest.raises(SnapshotRejected, match="GBP"):
-        build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+# --- Whole-payload rejections -----------------------------------------------
 
-
-def test_future_dated_entry_of_disabled_currency_is_ignored():
-    payload = load("snapshot_2026-11-23.json")
-    payload["exchangeRates"][2]["lastUpdate"] = "2026-11-25T10:00:00Z"  # JPY: not enabled
-    assert len(build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)) == 3
-
-
-@pytest.mark.parametrize("unit", [0, -1, "1", True, Decimal("1.5")])
-def test_invalid_unit_rejected(unit):
-    payload = load("snapshot_2026-11-23.json")
-    payload["exchangeRates"][0]["unit"] = unit
+@pytest.mark.parametrize("payload", [{}, {"exchangeRates": "nope"}])
+def test_structurally_malformed_payload_rejected(payload):
     with pytest.raises(SnapshotRejected):
-        build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+        parse_payload(payload)
+
+
+def test_no_enabled_pairs_rejected():
+    with pytest.raises(SnapshotRejected, match="No enabled"):
+        batch_of(load("snapshot_2026-11-23.json"), pairs=[])
+
+
+def test_non_ils_quote_rejected():
+    with pytest.raises(SnapshotRejected, match="ILS"):
+        batch_of(load("snapshot_2026-11-23.json"), pairs=[CurrencyPair("USD", "EUR", "USD")])
 
 
 def test_float_payload_is_a_programming_error():
     payload = json.loads(boi_fixture("snapshot_2026-11-23.json"))  # floats!
     with pytest.raises(TypeError):
-        build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+        batch_of(payload)
