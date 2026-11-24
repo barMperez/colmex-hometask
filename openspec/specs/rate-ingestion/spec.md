@@ -43,12 +43,16 @@ A refresh process, separate from the API process, SHALL periodically retrieve th
 - **THEN** the refresh process falls back to the publication-window and off-window intervals
 
 ### Requirement: Exact decimal handling
-The system SHALL keep source rates as exact decimal values from parsing through storage. It MUST NOT convert them to binary floating-point at any stage.
+The system SHALL keep source rates as exact decimal values from parsing through storage, on every supported database. It MUST NOT convert them to binary floating-point at any stage, and MUST NOT round them to a fixed number of decimal places.
 
 #### Scenario: Rate survives round trip unchanged
 - **GIVEN** BoI returns USD with `currentExchangeRate` 3.343
 - **WHEN** the snapshot is ingested and the stored observation is read back
 - **THEN** the stored source rate equals the decimal value 3.343 exactly
+
+#### Scenario: More than ten decimal places survive on every database
+- **WHEN** an observation with normalised rate 0.000012345678912 is stored and read back on SQLite and on Postgres
+- **THEN** both return exactly 0.000012345678912
 
 ### Requirement: Source unit normalisation
 The system SHALL store, for each observation, the source rate and source unit as published. It SHALL also store a normalised rate equal to the source rate divided by the source unit, meaning the value of 1 base-currency unit in the quote currency.
@@ -114,7 +118,7 @@ The system SHALL validate each enabled currency's entry independently. An entry 
 - **THEN** each entry's new observation is stored
 
 ### Requirement: Atomic and idempotent persistence
-The system SHALL store all new observations of the accepted currencies from one retrieval atomically. A pair and source timestamp that have already been stored SHALL NOT create a second observation.
+The system SHALL store all new observations of the accepted currencies from one retrieval atomically. An entry whose pair, source timestamp, source rate and source unit equal those of the latest stored revision for that pair and source timestamp SHALL NOT create a second observation.
 
 #### Scenario: Re-ingesting the same snapshot
 - **GIVEN** a snapshot has already been ingested
@@ -126,7 +130,7 @@ The system SHALL store all new observations of the accepted currencies from one 
 - **THEN** none of that retrieval's observations are stored
 
 ### Requirement: Observations are append-only
-Stored observations SHALL NOT be updated or deleted by ingestion. A same-day correction by BoI, meaning a new source timestamp for the same publication date, SHALL be stored as a new observation. The current observation for a pair SHALL be the one with the latest publication date, and among those the latest source timestamp.
+Stored observations SHALL NOT be updated or deleted by ingestion. A correction by BoI, meaning a new source timestamp for the same publication date, or the same source timestamp with a different source rate or unit, SHALL be stored as a new observation. The current observation for a pair SHALL be the one with the latest publication date, then the latest source timestamp, then the highest revision.
 
 #### Scenario: Same-day correction
 - **GIVEN** a USD observation dated 2026-11-23 with source timestamp 13:21Z and rate 3.343 exists
@@ -139,6 +143,23 @@ Stored observations SHALL NOT be updated or deleted by ingestion. A same-day cor
 - **WHEN** BoI returns a snapshot where only USD has a new source timestamp 14:05Z and EUR and GBP still carry 13:21Z
 - **THEN** exactly one new observation, for USD, is stored
 - **AND** the current EUR and GBP observations are unchanged
+
+#### Scenario: Correction with an unchanged source timestamp
+- **GIVEN** a USD observation with source timestamp 2026-11-23T13:21:10.7104898Z and rate 3.343 exists as revision 0
+- **WHEN** BoI returns USD with the same source timestamp and rate 3.341
+- **THEN** a new observation with rate 3.341 and revision 1 is stored, and the revision 0 observation is retained
+- **AND** the current USD observation has rate 3.341 and a different `rateId` than before
+- **AND** the correction is logged at warning level with the old and new rate, and listed in the ingestion audit record
+
+#### Scenario: Value flips back
+- **GIVEN** USD revisions 0 (3.343) and 1 (3.341) exist for the same source timestamp
+- **WHEN** BoI returns USD with that source timestamp and rate 3.343 again
+- **THEN** revision 2 with rate 3.343 is stored and is the current USD observation
+
+#### Scenario: Repeating the latest revision is a no-op
+- **GIVEN** the latest USD revision for a source timestamp has rate 3.341
+- **WHEN** BoI returns USD with that source timestamp and rate 3.341 again
+- **THEN** no observation is stored and no correction is logged
 
 ### Requirement: Failed retrieval preserves existing data
 A failed retrieval SHALL leave all stored observations unchanged. Failures include timeouts, connection errors, non-2xx responses and rejected snapshots. The refresh process SHALL retry within bounded limits and continue on its schedule.

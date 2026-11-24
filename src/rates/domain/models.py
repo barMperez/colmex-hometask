@@ -43,6 +43,8 @@ class RateObservation:
     publication_date: date
     source_last_update: datetime
     retrieved_at: datetime
+    revision: int = 0
+    """0 for the first value BoI sent for (pair, source_last_update); +1 per restatement."""
 
     def __post_init__(self) -> None:
         _require_decimal("rate", self.rate)

@@ -166,7 +166,7 @@ Which rounding applies is the consuming system's money rule, which is why this s
 
 **Read flow** (`GET /api/v1/exchange-rates`): verify the bearer token (401, not audited), validate codes (400), then check the pair is enabled (422), then load the active policy and calendar (503 if missing), then load the latest observation (404 if none), then `evaluate(...)`, write the `RATE_QUERIED` audit record and only then return 200 (503 `AUDIT_UNAVAILABLE` if the record can't be stored). Rejected authenticated reads are audited too. **BoI is never called on the read path**, so BoI outages don't affect reads; they only stop new data arriving.
 
-**Refresh flow**: every **1 min** on business days from the expected publication time until 30 min after the deadline (15:15–16:30 Mon–Thu, 12:15–13:30 Fri, taken from the active policy), every 5 min otherwise between 12:00 and 18:00, and hourly outside that window, at weekends and on holidays. The dense window costs about 60 extra BoI requests per business day (75 polls instead of 15), and it means a late BoI publication reaches us within a minute instead of up to five. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates **each enabled currency on its own**: present, rate > 0, unit is a positive integer, a parseable `lastUpdate`, and no publication date in the future. A missing or invalid currency is rejected with its reason and logged at error level, while the valid currencies are still stored, so a GBP problem never stops USD. Such an attempt is recorded as `partial`, which doesn't count as a success. Only a payload without an `exchangeRates` array is rejected as a whole. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. The accepted currencies are inserted in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and one audit event is written only if anything new was stored; it lists any rejected currencies. A failed fetch changes nothing.
+**Refresh flow**: every **1 min** on business days from the expected publication time until 30 min after the deadline (15:15–16:30 Mon–Thu, 12:15–13:30 Fri, taken from the active policy), every 5 min otherwise between 12:00 and 18:00, and hourly outside that window, at weekends and on holidays. The dense window costs about 60 extra BoI requests per business day (75 polls instead of 15), and it means a late BoI publication reaches us within a minute instead of up to five. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates **each enabled currency on its own**: present, rate > 0, unit is a positive integer, a parseable `lastUpdate`, and no publication date in the future. A missing or invalid currency is rejected with its reason and logged at error level, while the valid currencies are still stored, so a GBP problem never stops USD. Such an attempt is recorded as `partial`, which doesn't count as a success. Only a payload without an `exchangeRates` array is rejected as a whole. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. The accepted currencies are stored in **one transaction**. A value identical to the latest stored one for the same `(pair, source lastUpdate)` is a no-op. If BoI **restates** a rate without changing `lastUpdate`, the new value is stored as the next `revision` and becomes current, with a new `rateId`; the earlier value stays as history, and the correction is logged at WARNING (`rates.same_timestamp_correction ... from=... to=...`). One audit event is written only if anything new was stored; it lists the new observations, any corrections and any rejected currencies. A failed fetch changes nothing.
 
 **Code layout**
 
@@ -221,21 +221,35 @@ Policy v1: grace **45 min**, max age **7 days**. These are assumptions, not BoI 
 - no active policy exists;
 - the calendar leaves no business day within the max age, which means the calendar data is wrong.
 
-### Operator action: declaring an unexpected non-publication day
+### Operator actions
 
-BoI may skip a business day that is not in its published list ("lack of data"). The service cannot distinguish that from a BoI outage or a bug in our ingestion. So it **fails closed**: after the deadline, reads report `NOT_ELIGIBLE` / `PUBLICATION_OVERDUE` until a person confirms the day was genuinely skipped:
+All runtime changes to the calendar, the pairs and the policy go through four scripts. Each validates its input, then writes the change **and** an `audit_events` row (actor, reason, before/after) in **one transaction**. The API and the refresh process re-read the calendar, pairs and policy on every request or attempt, so changes take effect with no restart. Run them locally (`python scripts/<name>.py ...`, using `DATABASE_URL`) or with compose (`docker compose run --rm api python scripts/<name>.py ...`). Every script exits `0` done, `2` invalid input, `3` nothing to change or not allowed, `1` storage error.
+
+**Declaring an unexpected non-publication day.** BoI may skip a business day that is not in its published list ("lack of data"). The service can't tell that apart from a BoI outage or a bug in our ingestion, so it **fails closed**: after the deadline, reads report `NOT_ELIGIBLE` / `PUBLICATION_OVERDUE` until a person confirms the day was genuinely skipped:
 
 ```bash
-# local (uses DATABASE_URL, default ./rates.db)
-python scripts/declare_non_publication_day.py --date 2026-12-02 --reason "BoI did not publish: no data" --actor alice
-
-# docker compose
-docker compose run --rm api python scripts/declare_non_publication_day.py --date 2026-12-02 --reason "BoI did not publish: no data" --actor alice
+docker compose run --rm api python scripts/declare_non_publication_day.py --date 2026-12-02   --reason "BoI did not publish: no data" --actor alice
 ```
 
-The day row (`origin = OPERATOR`) and an `audit_events` row (actor, reason, time) are written in **one transaction**. The next read re-evaluates against the updated calendar, so the previous rate becomes `ELIGIBLE` again with no restart. The script exits `0` declared, `2` invalid input (e.g. empty reason), `3` already declared, `1` storage error.
+The next read re-evaluates against the updated calendar, so the previous rate becomes `ELIGIBLE` again. The date must be between **today and the policy's max age (7 days) before today**, in Israel time: a typo can't silently extend eligibility into the future. Anything else is refused (`2`, naming the allowed range) unless `--force` is given, and a forced declaration is recorded as `forced: true` in the audit.
 
-This script is the only runtime policy change in this release. Changing grace or max age means adding a new `policies` row (new version) through a migration.
+**Retracting a mistaken declaration.** Only operator-declared days can be retracted; days from the official BoI calendar change only by migration (exit `3`). The audit row keeps the removed declaration:
+
+```bash
+docker compose run --rm api python scripts/retract_non_publication_day.py --date 2026-12-02   --reason "Declared by mistake: BoI did publish" --actor bob
+```
+
+**Enabling or disabling a pair.** For example, when BoI stops sending a currency, every refresh attempt is `partial` until the pair is disabled. A disabled pair isn't served (422), ingested or listed in readiness. Unknown pairs are refused (`2`; new pairs are added by migration), and so are no-op changes (`3`):
+
+```bash
+docker compose run --rm api python scripts/set_pair_enabled.py --pair GBP/ILS --disable   --reason "BoI stopped publishing GBP" --actor alice
+```
+
+**Activating a new policy version.** This creates version = highest + 1 (time zone copied from the current version) and deactivates the current one. Every eligibility verdict reports the version that produced it. Negative grace, a max age below 1 day, malformed times (`2`) and values identical to the active version (`3`) are refused:
+
+```bash
+docker compose run --rm api python scripts/activate_policy.py --grace-minutes 30 --max-age-days 7   --weekday-publish-time 15:15 --friday-publish-time 12:15   --reason "Observed publications all before 15:45" --actor alice
+```
 
 ## 5. Decisions and trade-offs
 
@@ -251,13 +265,15 @@ The full design record, including the alternatives considered, is in [`openspec/
 | 6 | **Two processes from one codebase**: API (N workers, writes audit rows only) + refresh (exactly 1 writer of rate data) | One writer by construction, no distributed locking; BoI latency never sits on the read path | Two things to run (one `docker compose up`) |
 | 7 | **Append-only observations, idempotent on `(pair, BoI lastUpdate)`** | Same-day BoI corrections are kept as history; duplicate or concurrent refreshes are harmless | Storage grows slowly (3 rows per publication) |
 | 8 | **Per-currency validation** (replaced whole-snapshot validation) | Each pair's eligibility is judged on its own publication date, so a bad GBP entry has no reason to block USD deposits | A currency BoI stops sending leaves every attempt `partial`: `lastSuccessfulIngestionAt` freezes until the pair is disabled. That's intentional, so the problem gets alerted on |
-| 9 | **Exact decimals end to end**: `parse_float=Decimal`, `TEXT`/`NUMERIC` storage, JSON strings | Binary floats can't represent rates exactly | Consumers parse a string, not a JSON number |
+| 9 | **Exact decimals end to end**: `parse_float=Decimal`, `TEXT` (SQLite) / unconstrained `NUMERIC` (Postgres) storage, JSON strings | Binary floats can't represent rates exactly; a fixed scale such as `NUMERIC(18,10)` would silently round on one database but not the other | Consumers parse a string, not a JSON number |
 | 10 | **SQLAlchemy Core + Alembic; Postgres in compose, SQLite locally/tests** | One-command realistic setup, plus zero-setup dev; all dialect quirks in `adapters/db/types.py`; the same test suite runs on both | Hand-written migrations must work on both dialects |
 | 11 | **Policy and calendar read on every request**, no cache | A few dozen rows; operator changes apply immediately; nothing to invalidate across workers | A few extra cheap queries per request |
 | 12 | **GET with query params**, single pair | Read-only, cacheable semantics | Batch lookups would need a new endpoint |
 | 13 | **Python 3.12 + FastAPI + Pydantic v2** | Async, OpenAPI from types, `Decimal` serialises as string | Weaker static guarantees than e.g. .NET; covered by tests |
 | 14 | **Demo JWT auth** (one configured user, HS256, expiry checked against the injected clock) | Every rate needs an owner, and a demo needs no identity provider; one clock keeps expiry testable | Not production identity (see §6, §8) |
 | 15 | **Fail closed on audit**: a rate is returned only after its `RATE_QUERIED` record commits | A rate handed out with no trace of who received it, and what they were told, breaks the audit trail | One insert per read; an audit outage blocks reads (in practice only when the DB is down anyway) |
+| 16 | **BoI restatements are revisions**: same `lastUpdate`, different value → stored as the next `revision`, which becomes current | BoI is the source of truth; ignoring a restatement would serve a value BoI has replaced, and updating in place would break history and the audit trail | Corrections take effect without human review (each is logged at WARNING and audited, old and new value) |
+| 17 | **Audited operator scripts** for calendar, pairs and policy, with a bounded declaration window | Every runtime change to what's "eligible" must have an owner, a reason and a before/after; a typo shouldn't extend eligibility into the future | CLI with DB access, not an HTTP admin API; `--force` exists for planned exceptions |
 
 ## 6. Assumptions and limitations
 
@@ -332,7 +348,7 @@ TEST_DATABASE_URL=postgresql+asyncpg://rates:rates@localhost:5433/rates_test pyt
 On PowerShell: `$env:TEST_DATABASE_URL="postgresql+asyncpg://rates:rates@localhost:5433/rates_test"; pytest`. The suite drops and recreates the `public` schema before every test, so use a dedicated database: pointing it at `rates` would wipe the running stack's data.
 
 - `tests/unit`: eligibility table (every spec scenario), calendar and DST, BoI parser and client (retries, malformed bodies), response serialisation.
-- `tests/integration`: decimal and timestamp round trips, migrations and seeds, repositories, ingestion atomicity and idempotency, refresh loop resilience, operator script.
+- `tests/integration`: decimal and timestamp round trips, migrations and seeds, repositories, ingestion atomicity and idempotency, refresh loop resilience, the four operator scripts (window, force, retraction, pairs, policy versions) and their exit codes, same-timestamp revisions, and migration `0004` (including its refusal to downgrade while corrections exist).
 - `tests/contract`: the HTTP contract: status codes, problem details, decimal strings, "reads never call BoI", OpenAPI required fields.
 
 **Simulating BoI failure**: point the refresh process at an unreachable host:
@@ -344,7 +360,7 @@ BOI_URL=http://127.0.0.1:9/unreachable python -m rates.refresh
 
 With compose: `docker compose stop refresh`, then `docker compose run --rm -e BOI_URL=http://127.0.0.1:9/x refresh`. Existing data is untouched. Reads keep returning the stored rate, which becomes `NOT_ELIGIBLE` once the next deadline passes. `/health/ready` keeps reporting the earlier `lastSuccessfulIngestionAt`, so an alert on its age catches the outage before any deadline does.
 
-**Operator script**: see §4.
+**Operator scripts**: see §4 (declare and retract non-publication days, enable or disable pairs, activate policy versions).
 
 **Audit trail of rate queries.** Each authenticated read leaves one `RATE_QUERIED` row in `audit_events`: the user (`actor`), `base`/`quote` exactly as sent, the HTTP status and error code, and, for a returned rate, its `rateId`, rate, `publicationDate` and the full eligibility verdict the caller received. 401s are not audited (there is no user); they're logged as `auth.rejected`. With compose:
 
@@ -425,6 +441,32 @@ $ docker compose exec postgres psql ... RATE_QUERIED rows since the first call:
  demo  | ILS  | USD   | 422    | UNSUPPORTED_CURRENCY_PAIR |                                      |
 
 api-1 | auth.rejected code=AUTHENTICATION_REQUIRED path=/api/v1/exchange-rates ...   # the 401: logged, not audited
+```
+
+**Revisions, exact decimals and operator scripts** (Tue 24/11, redeploy applying migration `0004` to the live database with 6 stored observations):
+
+```text
+migrate-1 | Running upgrade 0003_refresh_status -> 0004_revisions_and_exact_numeric
+
+rate_observations: rate numeric (no precision/scale) | source_rate numeric | revision integer
+unique key: uq_rate_observations_pair_source_ts_revision      existing rows: 6, max(revision) 0
+
+$ ... declare_non_publication_day.py --date 2026-12-02 ...   # future date
+error: 2026-12-02 is outside the allowed range 2026-11-17 to 2026-11-24; use --force to override   (exit 2)
+$ ... retract_non_publication_day.py --date 2026-12-02 ...
+error: 2026-12-02 is not a non-publication day                                                       (exit 3)
+$ ... set_pair_enabled.py --pair GBP/ILS --disable ...        GBP/ILS disabled                         (exit 0)
+$ ... set_pair_enabled.py --pair GBP/ILS --enable ...         GBP/ILS enabled                          (exit 0)
+$ ... activate_policy.py --grace-minutes 30 ...               activated policy version 2               (exit 0)
+$ ... activate_policy.py --grace-minutes 45 ...               activated policy version 3   (v1 values restored)
+$ ... declare_non_publication_day.py --date 2026-11-24 ...    declared 2026-11-24                      (exit 0)
+$ ... retract_non_publication_day.py --date 2026-11-24 ...    retracted 2026-11-24                     (exit 0)
+
+audit_events:  PAIR_DISABLED alice GBP/ILS | PAIR_ENABLED alice GBP/ILS | POLICY_ACTIVATED alice 2 |
+               POLICY_ACTIVATED alice 3 | NON_PUBLICATION_DAY_DECLARED alice 2026-11-24 (forced=false) |
+               NON_PUBLICATION_DAY_RETRACTED bob 2026-11-24
+policies:      v1 grace 45 inactive | v2 grace 30 inactive | v3 grace 45 active
+GBP/ILS read:  4.3757 ELIGIBLE policyVersion 3
 ```
 
 ## 8. Out of scope and possible extensions

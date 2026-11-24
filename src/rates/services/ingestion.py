@@ -9,7 +9,12 @@ from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from rates.adapters.boi.parser import RejectedCurrency, build_ingestion, parse_payload
-from rates.adapters.db.repos import SqlAuditRepository, SqlPairRepository, SqlRateRepository
+from rates.adapters.db.repos import (
+    Correction,
+    SqlAuditRepository,
+    SqlPairRepository,
+    SqlRateRepository,
+)
 from rates.clock import Clock
 from rates.domain.errors import SnapshotRejected
 from rates.domain.models import BOI_TIMEZONE, AuditEvent
@@ -35,6 +40,8 @@ class IngestionResult:
     """Latest BoI ``lastUpdate`` across the snapshot's enabled entries."""
     rejected: list[RejectedCurrency] = field(default_factory=list)
     """Enabled currencies rejected by validation (the others were accepted)."""
+    corrections: list[Correction] = field(default_factory=list)
+    """Same-timestamp restatements by BoI, stored as new revisions."""
 
     @property
     def outcome(self) -> str:
@@ -69,7 +76,20 @@ class IngestionService:
                     + "; ".join(f"{r.currency}: {r.reason}" for r in batch.rejected)
                 )
             observations = batch.accepted
-            inserted = await SqlRateRepository(conn).insert_many(observations)
+            stored = await SqlRateRepository(conn).store_batch(observations)
+            inserted = stored.inserted
+            for c in stored.corrections:
+                log.warning(
+                    "rates.same_timestamp_correction pair=%s source_last_update=%s from=%s to=%s "
+                    "unit_from=%d unit_to=%d revision=%d",
+                    c.pair,
+                    c.source_last_update.isoformat(),
+                    c.previous_rate,
+                    c.new_rate,
+                    c.previous_unit,
+                    c.new_unit,
+                    c.revision,
+                )
             if inserted:
                 ingestion_id = uuid4()
                 await SqlAuditRepository(conn).record(
@@ -88,8 +108,21 @@ class IngestionService:
                                     "id": str(o.id),
                                     "source_last_update": o.source_last_update.isoformat(),
                                     "publication_date": o.publication_date.isoformat(),
+                                    "revision": o.revision,
                                 }
                                 for o in inserted
+                            ],
+                            "corrections": [
+                                {
+                                    "pair": c.pair,
+                                    "source_last_update": c.source_last_update.isoformat(),
+                                    "previous_rate": str(c.previous_rate),
+                                    "previous_unit": c.previous_unit,
+                                    "new_rate": str(c.new_rate),
+                                    "new_unit": c.new_unit,
+                                    "revision": c.revision,
+                                }
+                                for c in stored.corrections
                             ],
                             "rejected": [
                                 {"currency": r.currency, "reason": r.reason}
@@ -105,4 +138,5 @@ class IngestionService:
             latest_publication_date=max(o.publication_date for o in observations),
             latest_source_last_update=max(o.source_last_update for o in observations),
             rejected=batch.rejected,
+            corrections=stored.corrections,
         )

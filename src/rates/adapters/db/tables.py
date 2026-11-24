@@ -51,14 +51,21 @@ rate_observations = Table(
     Column("publication_date", Date, nullable=False),
     Column("source_last_update", UtcDateTime, nullable=False),
     Column("retrieved_at", UtcDateTime, nullable=False),
+    # 0 for the first value BoI sent for (pair, source_last_update); +1 per restatement.
+    Column("revision", Integer, nullable=False, server_default=text("0")),
     ForeignKeyConstraint(
         ["base_currency", "quote_currency"],
         ["currency_pairs.base_currency", "currency_pairs.quote_currency"],
     ),
     UniqueConstraint(
-        "base_currency", "quote_currency", "source_last_update", name="uq_rate_observations_pair_source_ts"
+        "base_currency",
+        "quote_currency",
+        "source_last_update",
+        "revision",
+        name="uq_rate_observations_pair_source_ts_revision",
     ),
     CheckConstraint("source_unit > 0", name="positive_unit"),
+    CheckConstraint("revision >= 0", name="revision_non_negative"),
 )
 Index(
     "ix_rate_observations_latest",
@@ -66,6 +73,7 @@ Index(
     rate_observations.c.quote_currency,
     rate_observations.c.publication_date.desc(),
     rate_observations.c.source_last_update.desc(),
+    rate_observations.c.revision.desc(),
 )
 
 non_publication_days = Table(

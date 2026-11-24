@@ -594,3 +594,27 @@ async def test_failed_audit_on_rejection_keeps_the_response(engine, make_client,
     assert response.status_code == 422
     assert response.json()["code"] == "UNSUPPORTED_CURRENCY_PAIR"
     assert "audit.write_failed status=422" in caplog.text
+
+
+# --- Same-timestamp corrections -----------------------------------------------------
+
+async def test_read_serves_same_timestamp_correction(engine, make_client):
+    await ingest(engine)
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+    before = (await get(client, "base=USD&quote=ILS")).json()
+
+    restated = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    next(e for e in restated["exchangeRates"] if e["key"] == "USD")["currentExchangeRate"] = Decimal("3.341")
+
+    class Restated:
+        async def fetch(self):
+            return restated
+
+    await IngestionService(engine, Restated(), FixedClock(il(2026, 11, 23, 16, 30))).run_once()
+    after = (await get(client, "base=USD&quote=ILS")).json()
+
+    assert before["rate"] == "3.343"
+    assert after["rate"] == "3.341"
+    assert after["rateId"] != before["rateId"]
+    assert after["source"]["lastUpdate"] == before["source"]["lastUpdate"]  # same BoI timestamp
+    assert after["eligibility"]["status"] == "ELIGIBLE"

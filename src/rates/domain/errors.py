@@ -39,5 +39,9 @@ class SnapshotRejected(DomainError):
     """A BoI snapshot failed validation; nothing from it may be stored."""
 
 
-class AlreadyDeclared(DomainError):
+class AlreadyInState(DomainError):
+    """An operator action would change nothing (or targets something it may not change)."""
+
+
+class AlreadyDeclared(AlreadyInState):
     pass

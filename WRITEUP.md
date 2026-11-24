@@ -12,8 +12,8 @@ This document is for the reviewer. The [README](README.md) explains how to run t
   - A **refresh process** is the only writer of rate data. It polls BoI, validates each currency, and stores observations append-only and idempotently.
   - An **API** serves reads from the database only, so a BoI outage never reaches a reader.
 - **Correctness rules:** exact decimals end to end; every instant timezone-aware; **fail closed** whenever the policy can't be evaluated; a rate leaves the API only after its audit record is committed.
-- **How I worked:** spec-driven. Each change has a proposal, behaviour specs with testable scenarios, a design with the alternatives considered, and a task list (see `openspec/`). There were four changes in total. Each was verified against its specs and against the live BoI API in Docker.
-- **Evidence:** 217 tests on SQLite, and the same suite on Postgres (215 passed, 2 SQLite-only skips). Live runs are captured in README §7, including simulated BoI outages, a database outage and a Postgres crash.
+- **How I worked:** spec-driven. Each change has a proposal, behaviour specs with testable scenarios, a design with the alternatives considered, and a task list (see `openspec/`). There were five changes in total. Each was verified against its specs and against the live BoI API in Docker.
+- **Evidence:** 246 tests on SQLite, and the same suite on Postgres (244 passed, 2 SQLite-only skips). Live runs are captured in README §7, including simulated BoI outages, a database outage and a Postgres crash.
 
 ---
 
@@ -157,6 +157,8 @@ The most useful part of the process was letting evidence change decisions. Each 
    - **Where the audit write sits.** In the route and the error handlers, not in middleware: middleware can't turn an already-started 200 into a 503.
    - **Two framework assumptions, checked before designing.** I confirmed with a throwaway app that FastAPI resolves auth before validating parameters, and that the user is visible in the 400 handler.
 
+5. **Closing the self-review's gaps** (change `fix-review-edge-cases`, section 8). When choosing how to handle a BoI restatement, the conservative option was to fail closed on that pair. I chose to trust BoI instead, because it's the authoritative source and blocking a deposit over a restated value would fail the availability half of the standard. History plus a WARNING and an audit entry keep it reviewable.
+
 ## 7. How I worked
 
 - **Spec-driven, one change at a time.** Each change produced a proposal (why), delta specs (behaviour, as WHEN/THEN scenarios), a design (decisions with rejected alternatives) and tasks, each with its own check. Specs are merged into `openspec/specs/` when a change is archived. This made "done" checkable: every scenario maps to a test.
@@ -168,17 +170,19 @@ The most useful part of the process was letting evidence change decisions. Each 
   - Postgres crashed: Docker restarts it;
   - API started without `JWT_SECRET`: it refuses to start with exit code 1.
 
-## 8. Final self-review: edge cases still open
+## 8. Final self-review: what it found and how it was resolved
 
-Before submitting I reviewed the code adversarially. These are the remaining edge cases, with evidence. None is hit by BoI's normal behaviour, but each is a real gap:
+Before submitting I reviewed the code adversarially and confirmed each suspicion with a small probe against SQLite and Postgres, not just by reading. Four real gaps came out of it. None is hit by BoI's normal behaviour, but each was fixed in a fifth change, `fix-review-edge-cases`; the decisions are in its `design.md`.
 
-| # | Edge case | Evidence | Impact | Fix I'd make |
+| # | Edge case found | Evidence | Resolution | Proven by |
 |---|---|---|---|---|
-| 1 | **BoI corrects a rate without changing `lastUpdate`.** The `(pair, lastUpdate)` key makes the insert a silent no-op, the attempt reports `success`, and the old rate keeps being served. | Probe: re-ingesting USD 3.999 with the same timestamp → `inserted=0, outcome=success`, stored rate still 3.343. | A wrong rate served as ELIGIBLE until the next publication. | On conflict, compare the rate. If it differs, store nothing, mark the attempt as failed, log at ERROR and alert, because the source is inconsistent and needs a human. |
-| 2 | **Postgres rounds beyond 10 decimal places** (`NUMERIC(18,10)`), while SQLite keeps the exact text. | Probe: `0.000012345678912` → `0.0000123457` on Postgres, exact on SQLite. | BoI rates have 4–5 decimals (up to about 7 after dividing by `unit`), so not hit today; but the two databases disagree. | Reject an entry whose normalised value exceeds the column's scale or precision during validation, so it's never silently rounded. |
-| 3 | **Enabling or disabling a pair, and changing the policy, have no audited tooling.** The documented remedy for a currency BoI stops sending ("disable the pair") needs raw SQL; policy changes need a migration. | Code: only `declare_non_publication_day` exists as an operator action. | Unaudited operational changes, contrary to the brainstorm's audit goals. | Operator commands for pairs and policy versions, written with their audit record in one transaction (the same pattern as the existing script). |
-| 4 | **An operator can declare any date**, including a future business day, which would keep yesterday's rate eligible, and there's no "undeclare". | Code: no date bounds in `services/operator.py`. | A typo extends eligibility silently (though it's audited). | Restrict to recent or today's dates unless `--force`; add an audited retraction. |
-| 5 | **Smaller items:** the BoI client doesn't follow redirects or honour `Retry-After`; the token endpoint has no rate limiting; the audit table grows by about one row per read with no retention policy; policy timezone and the parser's Israel timezone are separate constants. | Code reading. | Low: a redirect or 429 storm fails safe (stored rate kept, alerts fire); auth and audit growth are documented as demo-only. | Follow redirects within the BoI domain and honour `Retry-After`; login throttling; an audit retention job; derive both timezones from the policy row. |
+| 1 | **BoI restates a rate without changing `lastUpdate`.** The `(pair, lastUpdate)` key made the insert a silent no-op, so we kept serving the replaced value as ELIGIBLE. | Probe: base snapshot with USD 3.343, then the same snapshot with USD 3.341 under the same `lastUpdate` → `inserted=0, outcome=success`, still served 3.343. | **BoI is the source of truth:** a different value for a stored `(pair, lastUpdate)` becomes the next `revision` and is current (new `rateId`), and the old value stays as history. Compared with the *latest* revision, so a value that flips back becomes current again. Logged at WARNING and listed in the ingestion audit. | Repository tests (no-op, revision 1, flip-back to revision 2, unit-only change), ingestion test, and a contract test where the API serves 3.341 with a new `rateId` |
+| 2 | **Postgres rounded beyond 10 decimal places** (`NUMERIC(18,10)`), while SQLite kept the exact text. | Probe: `0.000012345678912` → `0.0000123457` on Postgres only. | Unconstrained `NUMERIC` (migration `0004`, a lossless widening). | The decimal round-trip test with 15 decimal places and `123456789.123456789`, passing on both databases |
+| 3 | **No audited tooling for pairs or policy.** The remedy for a currency BoI stops sending ("disable the pair") needed raw SQL; policy changes needed a migration. | Only one operator script existed. | `set_pair_enabled.py` and `activate_policy.py`: each validates, then writes the change and a before/after audit row in one transaction, with no restart needed. | Integration tests for every outcome and exit code, plus a live Compose run (README §7) |
+| 4 | **Any date could be declared a non-publication day,** including a future one, which extends eligibility, and there was no undo. | No bounds in the operator service. | Declarations are limited to today back through the policy's max age (Israel time), otherwise `--force`, which is audited. `retract_non_publication_day.py` undoes operator declarations only, never BoI-calendar days. | Integration tests (window edges, future and old dates, force, retraction) and the live run |
+| 5 | **Smaller items:** the BoI client doesn't follow redirects or honour `Retry-After`; the token endpoint has no rate limiting; the audit table grows by about one row per read with no retention policy; policy timezone and the parser's Israel timezone are separate constants. | Code reading. | Still open (low): Low: a redirect or 429 storm fails safe (stored rate kept, alerts fire); auth and audit growth are documented as demo-only. Follow redirects within the BoI domain and honour `Retry-After`; login throttling; an audit retention job; derive both timezones from the policy row. | — |
+
+Migration `0004` also refuses to be downgraded while corrections are stored, rather than deleting history. A test covers that too.
 
 ## 9. Use of AI
 
@@ -186,7 +190,7 @@ I used Claude (Anthropic) as a pair-engineer throughout: exploring the design sp
 
 ## 10. What I'd do next
 
-1. Fix the four open edge cases in section 8, starting with #1: a silently ignored correction is the only one that can serve a wrong rate.
+1. The remaining low-severity items in section 8, row 5: redirects and `Retry-After`, login throttling, audit retention.
 2. Add CI (GitHub Actions running the suite on SQLite and on a Postgres service container), plus `ruff` and `mypy`.
 3. Metrics (Prometheus): last successful ingestion, observation age per pair, eligible vs not-eligible reads, audit failures.
 4. Automate loading next year's BoI calendar, or at least alert from the existing calendar-expiry warning.

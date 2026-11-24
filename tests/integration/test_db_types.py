@@ -29,7 +29,10 @@ async def probe_engine(engine):
         await conn.run_sync(probe_metadata.drop_all)
 
 
-@pytest.mark.parametrize("value", ["3.343", "4.3785", "0.021026", "100", "0.00004", "0.0004"])
+@pytest.mark.parametrize(
+    "value",
+    ["3.343", "4.3785", "0.021026", "100", "0.00004", "0.0004", "0.000012345678912", "123456789.123456789"],
+)
 async def test_decimal_round_trips_exactly(probe_engine, value):
     async with probe_engine.begin() as conn:
         await conn.execute(probe.insert().values(id=1, amount=Decimal(value)))

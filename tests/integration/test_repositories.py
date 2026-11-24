@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -50,7 +51,7 @@ async def test_latest_for_pair_orders_by_date_then_source_timestamp(engine):
     async with engine.begin() as conn:
         repo = SqlRateRepository(conn)
         assert await repo.latest_for_pair("USD", "ILS") is None
-        await repo.insert_many([corrected, older, first])
+        await repo.store_batch([corrected, older, first])
 
     async with engine.connect() as conn:
         latest = await SqlRateRepository(conn).latest_for_pair("USD", "ILS")
@@ -59,14 +60,50 @@ async def test_latest_for_pair_orders_by_date_then_source_timestamp(engine):
     assert latest.rate == Decimal("3.341")
 
 
-async def test_insert_many_ignores_duplicates(engine):
+async def test_store_batch_ignores_identical_repeats(engine):
     ts = datetime(2026, 11, 23, 13, 21, 10, 710489, tzinfo=UTC)
     async with engine.begin() as conn:
         repo = SqlRateRepository(conn)
-        assert len(await repo.insert_many([obs("3.343", date(2026, 11, 23), ts)])) == 1
-        # Same pair + source timestamp, new id: ignored.
-        assert await repo.insert_many([obs("3.343", date(2026, 11, 23), ts)]) == []
+        first = await repo.store_batch([obs("3.343", date(2026, 11, 23), ts)])
+        assert [o.revision for o in first.inserted] == [0] and first.corrections == []
+        # Same pair, source timestamp and value, new id: no-op.
+        again = await repo.store_batch([obs("3.343", date(2026, 11, 23), ts)])
+        assert again.inserted == [] and again.corrections == []
+        # Numerically equal (3.3430 == 3.343): still a no-op.
+        assert (await repo.store_batch([obs("3.3430", date(2026, 11, 23), ts)])).inserted == []
         assert await repo.latest_retrieved_at() == ts
+
+
+async def test_same_timestamp_corrections_become_revisions(engine):
+    ts = datetime(2026, 11, 23, 13, 21, 10, 710489, tzinfo=UTC)
+    day = date(2026, 11, 23)
+    async with engine.begin() as conn:
+        repo = SqlRateRepository(conn)
+        await repo.store_batch([obs("3.343", day, ts)])
+
+        corrected = await repo.store_batch([obs("3.341", day, ts)])
+        (c,) = corrected.corrections
+        assert (c.pair, c.previous_rate, c.new_rate, c.revision) == ("USD/ILS", Decimal("3.343"), Decimal("3.341"), 1)
+        current = await repo.latest_for_pair("USD", "ILS")
+        assert (current.rate, current.revision) == (Decimal("3.341"), 1)
+
+        flipped = await repo.store_batch([obs("3.343", day, ts)])  # A -> B -> A
+        assert [o.revision for o in flipped.inserted] == [2]
+        current = await repo.latest_for_pair("USD", "ILS")
+        assert (current.rate, current.revision) == (Decimal("3.343"), 2)
+
+        assert (await repo.store_batch([obs("3.343", day, ts)])).inserted == []  # repeat of latest
+
+
+async def test_unit_change_alone_is_a_correction(engine):
+    ts = datetime(2026, 11, 23, 13, 21, 10, tzinfo=UTC)
+    async with engine.begin() as conn:
+        repo = SqlRateRepository(conn)
+        await repo.store_batch([obs("3.343", date(2026, 11, 23), ts)])
+        changed = replace(obs("3.343", date(2026, 11, 23), ts), source_unit=10)
+        result = await repo.store_batch([changed])
+        assert [o.revision for o in result.inserted] == [1]
+        assert (result.corrections[0].previous_unit, result.corrections[0].new_unit) == (1, 10)
 
 
 async def test_no_active_policy_returns_none(engine):

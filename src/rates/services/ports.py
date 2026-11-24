@@ -2,10 +2,13 @@
 
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from rates.domain.calendar import CalendarView
 from rates.domain.models import AuditEvent, CurrencyPair, Policy, RateObservation
+
+if TYPE_CHECKING:
+    from rates.adapters.db.repos import StoreResult
 
 
 class PairRepository(Protocol):
@@ -15,7 +18,9 @@ class PairRepository(Protocol):
 
 class RateRepository(Protocol):
     async def latest_for_pair(self, base: str, quote: str) -> RateObservation | None: ...
-    async def insert_many(self, observations: Sequence[RateObservation]) -> list[RateObservation]: ...
+    async def store_batch(self, observations: Sequence[RateObservation]) -> "StoreResult":
+        """Insert new observations and same-timestamp corrections (as revisions)."""
+        ...
     async def latest_retrieved_at(self) -> datetime | None: ...
 
 

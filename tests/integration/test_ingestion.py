@@ -163,3 +163,49 @@ async def test_decimal_round_trip_from_boi_to_storage(engine):
     assert usd.rate == Decimal("3.343")
     assert str(usd.rate) == "3.343"
     assert isinstance(usd.source_rate, Decimal)
+
+
+async def test_same_timestamp_correction_is_stored_as_revision(engine, caplog):
+    await service(engine, "snapshot_2026-11-23.json").run_once()
+    async with engine.connect() as conn:
+        before = await SqlRateRepository(conn).latest_for_pair("USD", "ILS")
+
+    corrected = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    usd = next(e for e in corrected["exchangeRates"] if e["key"] == "USD")
+    usd["currentExchangeRate"] = Decimal("3.341")  # same lastUpdate, restated value
+
+    class Restated:
+        async def fetch(self):
+            return corrected
+
+    with caplog.at_level("WARNING", logger="rates.services.ingestion"):
+        later = FixedClock(datetime(2026, 11, 23, 14, 30, tzinfo=UTC))  # distinct audit time
+        result = await IngestionService(engine, Restated(), later).run_once()
+
+    assert result.inserted == 1
+    assert [(c.pair, c.previous_rate, c.new_rate, c.revision) for c in result.corrections] == [
+        ("USD/ILS", Decimal("3.343"), Decimal("3.341"), 1)
+    ]
+    async with engine.connect() as conn:
+        after = await SqlRateRepository(conn).latest_for_pair("USD", "ILS")
+        audit = (
+            await conn.execute(select(audit_events).order_by(audit_events.c.occurred_at.desc()))
+        ).mappings().first()
+    assert after.rate == Decimal("3.341") and after.revision == 1 and after.id != before.id
+    assert await count(engine, rate_observations) == 4  # 3 originals + 1 revision; nothing updated
+    (entry,) = audit["after"]["corrections"]
+    assert (entry["pair"], entry["previous_rate"], entry["new_rate"], entry["revision"]) == (
+        "USD/ILS", "3.343", "3.341", 1
+    )
+    assert "rates.same_timestamp_correction pair=USD/ILS" in caplog.text
+    assert "from=3.343 to=3.341" in caplog.text
+
+
+async def test_identical_reingest_logs_no_correction(engine, caplog):
+    svc = service(engine, "snapshot_2026-11-23.json", "snapshot_2026-11-23.json")
+    await svc.run_once()
+    with caplog.at_level("WARNING", logger="rates.services.ingestion"):
+        again = await svc.run_once()
+    assert again.inserted == 0 and again.corrections == []
+    assert "same_timestamp_correction" not in caplog.text
+    assert await count(engine, audit_events) == 1

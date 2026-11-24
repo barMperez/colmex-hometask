@@ -1,4 +1,6 @@
-from datetime import date, time
+from datetime import UTC, date, datetime, time
+from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -10,6 +12,7 @@ from rates.adapters.db.tables import (
     currency_pairs,
     non_publication_days,
     policies,
+    rate_observations,
     refresh_status,
 )
 from tests.conftest import alembic_config, is_postgres
@@ -89,3 +92,45 @@ async def test_seed_data(engine):
             "consecutive_failures": 0,
         }
     ]
+
+
+async def _columns_and_uniques(url: str):
+    eng = create_engine(url)
+    try:
+        async with eng.connect() as conn:
+            def inspect_it(c):
+                insp = inspect(c)
+                cols = {col["name"]: col for col in insp.get_columns("rate_observations")}
+                uniques = {tuple(u["column_names"]) for u in insp.get_unique_constraints("rate_observations")}
+                return cols, uniques
+            return await conn.run_sync(inspect_it)
+    finally:
+        await eng.dispose()
+
+
+async def test_rate_observations_have_revisions(migrated_url):
+    cols, uniques = await _columns_and_uniques(migrated_url)
+    assert "revision" in cols and cols["revision"]["nullable"] is False
+    assert ("base_currency", "quote_currency", "source_last_update", "revision") in uniques
+    assert ("base_currency", "quote_currency", "source_last_update") not in uniques
+    if is_postgres():
+        assert cols["rate"]["type"].precision is None and cols["rate"]["type"].scale is None
+
+
+async def test_downgrade_refuses_while_corrections_are_stored(engine, migrated_url):
+    ts = datetime(2026, 11, 23, 13, 21, 10, tzinfo=UTC)
+    rows = [
+        {"id": uuid4(), "base_currency": "USD", "quote_currency": "ILS", "rate": Decimal(r),
+         "source_rate": Decimal(r), "source_unit": 1, "publication_date": date(2026, 11, 23),
+         "source_last_update": ts, "retrieved_at": ts, "revision": rev}
+        for rev, r in enumerate(["3.343", "3.341"])
+    ]
+    async with engine.begin() as conn:
+        await conn.execute(rate_observations.insert(), rows)
+
+    with pytest.raises(RuntimeError, match="Refusing to downgrade 0004"):
+        await _run_sync_alembic(
+            lambda: command.downgrade(alembic_config(migrated_url), "0003_refresh_status")
+        )
+    cols, _ = await _columns_and_uniques(migrated_url)
+    assert "revision" in cols  # nothing was undone

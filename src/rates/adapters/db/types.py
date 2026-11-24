@@ -1,7 +1,8 @@
 """Dialect differences live here and nowhere else.
 
 * ``DecimalText``  - exact decimals: TEXT on SQLite (which has no decimal type and
-  would otherwise round-trip through REAL), NUMERIC(18,10) on Postgres.
+  would otherwise round-trip through REAL), unconstrained NUMERIC on Postgres (a
+  fixed scale would silently round; unconstrained NUMERIC stores any decimal exactly).
 * ``UtcDateTime``  - aware UTC datetimes: fixed-width ISO-8601 TEXT on SQLite (which
   drops timezones and so sorts correctly as text), TIMESTAMPTZ on Postgres.
 * ``JsonDocument`` - JSON on SQLite, JSONB on Postgres.
@@ -20,17 +21,13 @@ from rates.domain.decimals import canonical_decimal, decimal_to_plain_string
 
 __all__ = ["DecimalText", "UtcDateTime", "JsonDocument", "insert_ignore", "canonical_decimal"]
 
-DECIMAL_PRECISION = 18
-DECIMAL_SCALE = 10
-
-
 class DecimalText(TypeDecorator[Decimal]):
     impl = String
     cache_ok = True
 
     def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
         if dialect.name == "postgresql":
-            return dialect.type_descriptor(NUMERIC(DECIMAL_PRECISION, DECIMAL_SCALE, asdecimal=True))
+            return dialect.type_descriptor(NUMERIC(asdecimal=True))
         return dialect.type_descriptor(String(64))
 
     def process_bind_param(self, value: Decimal | None, dialect: Dialect) -> Any:
