@@ -43,7 +43,7 @@ The system SHALL store, for each observation, the source rate and source unit as
 - **THEN** the normalised rate is 0.021026
 
 ### Requirement: Publication date derivation
-The system SHALL derive an observation's publication date by converting the source `lastUpdate` timestamp to a calendar date in Asia/Jerusalem. It SHALL also store the source timestamp itself.
+The system SHALL derive each observation's publication date by converting that entry's own source `lastUpdate` timestamp to a calendar date in Asia/Jerusalem. It SHALL also store that source timestamp itself.
 
 #### Scenario: UTC timestamp converted to Israel date
 - **WHEN** BoI returns `lastUpdate` 2026-11-23T13:21:10.7104898Z
@@ -54,8 +54,13 @@ The system SHALL derive an observation's publication date by converting the sour
 - **WHEN** BoI returns `lastUpdate` 2026-11-23T22:30:00Z
 - **THEN** the observation's publication date is 2026-11-24
 
+#### Scenario: Entries with different timestamps
+- **WHEN** a snapshot has USD with `lastUpdate` 2026-11-23T14:05:00Z and EUR with `lastUpdate` 2026-11-23T13:21:10Z
+- **THEN** the USD observation stores source timestamp 14:05Z and the EUR observation stores 13:21:10Z
+- **AND** both have publication date 2026-11-23
+
 ### Requirement: Snapshot-level validation
-The system SHALL validate each retrieved snapshot as a whole and SHALL reject the entire snapshot, storing nothing from it, if any check fails. A valid snapshot contains every enabled pair. Each entry has a rate greater than zero, a source unit that is a positive integer, and a publication date not after the current Asia/Jerusalem date.
+The system SHALL validate each retrieved snapshot as a whole and SHALL reject the entire snapshot, storing nothing from it, if any check fails. A valid snapshot contains every enabled pair. Each entry has a rate greater than zero, a source unit that is a positive integer, and a publication date not after the current Asia/Jerusalem date. The system SHALL NOT reject a snapshot because its entries carry different `lastUpdate` values.
 
 #### Scenario: Missing enabled currency rejects snapshot
 - **GIVEN** USD, EUR and GBP pairs are enabled
@@ -79,6 +84,15 @@ The system SHALL validate each retrieved snapshot as a whole and SHALL reject th
 - **WHEN** a valid snapshot also contains currencies that have no enabled pair
 - **THEN** those entries are not stored and do not cause rejection
 
+#### Scenario: One future-dated entry rejects the whole snapshot
+- **GIVEN** the current Asia/Jerusalem date is 2026-11-24
+- **WHEN** a snapshot's USD and EUR entries convert to 2026-11-24 but its GBP entry converts to 2026-11-25
+- **THEN** no observations from that snapshot are stored
+
+#### Scenario: Differing timestamps are accepted
+- **WHEN** an otherwise valid snapshot has entries whose `lastUpdate` values differ
+- **THEN** the snapshot is accepted and its new observations are stored
+
 ### Requirement: Atomic and idempotent persistence
 The system SHALL store all new observations from a valid snapshot atomically. A pair and source timestamp that have already been stored SHALL NOT create a second observation.
 
@@ -100,6 +114,12 @@ Stored observations SHALL NOT be updated or deleted by ingestion. A same-day cor
 - **THEN** both observations are retained
 - **AND** the current USD observation has rate 3.341
 
+#### Scenario: Single-currency correction leaves other pairs untouched
+- **GIVEN** USD, EUR and GBP observations dated 2026-11-23 with source timestamp 13:21Z exist
+- **WHEN** BoI returns a snapshot where only USD has a new source timestamp 14:05Z and EUR and GBP still carry 13:21Z
+- **THEN** exactly one new observation, for USD, is stored
+- **AND** the current EUR and GBP observations are unchanged
+
 ### Requirement: Failed retrieval preserves existing data
 A failed retrieval SHALL leave all stored observations unchanged. Failures include timeouts, connection errors, non-2xx responses and rejected snapshots. The refresh process SHALL retry within bounded limits and continue on its schedule.
 
@@ -110,12 +130,28 @@ A failed retrieval SHALL leave all stored observations unchanged. Failures inclu
 - **AND** the refresh process attempts retrieval again at its next scheduled time
 
 ### Requirement: Ingestion is auditable and observable
-Each ingestion that stores at least one new observation SHALL produce an audit record. Every retrieval attempt SHALL be recorded in logs with its outcome, and the time of the last successful ingestion SHALL be observable.
+Each ingestion that stores at least one new observation SHALL produce an audit record. Every retrieval attempt SHALL be recorded in logs with its outcome. After each attempt, the refresh process SHALL durably record the attempt time, its outcome and the time of the last successful ingestion. The readiness endpoint SHALL report that last successful ingestion time.
 
 #### Scenario: New observations produce audit record
 - **WHEN** a snapshot results in three new observations
-- **THEN** one audit record identifies the ingestion, the pairs affected and the source timestamp
+- **THEN** one audit record identifies the ingestion, the pairs affected and the source timestamp of each new observation
 
 #### Scenario: Duplicate snapshot produces no audit record
 - **WHEN** a snapshot results in no new observations
 - **THEN** no ingestion audit record is written
+
+#### Scenario: Successful attempt with nothing new is still a success
+- **GIVEN** the latest observation was retrieved at 2026-11-23T13:25:00Z
+- **WHEN** an ingestion at 2026-11-24T09:00:00Z succeeds but stores no new observation
+- **THEN** the readiness endpoint reports `lastSuccessfulIngestionAt` 2026-11-24T09:00:00Z
+- **AND** `latestRetrievedAt` is still 2026-11-23T13:25:00Z
+
+#### Scenario: Failed attempt does not move the last success
+- **GIVEN** the last successful ingestion was at 2026-11-24T09:00:00Z
+- **WHEN** a later attempt fails because BoI is unavailable
+- **THEN** the readiness endpoint still reports `lastSuccessfulIngestionAt` 2026-11-24T09:00:00Z
+- **AND** the recorded outcome of the latest attempt is a failure
+
+#### Scenario: No successful ingestion yet
+- **WHEN** the refresh process has never completed a successful ingestion
+- **THEN** the readiness endpoint reports `lastSuccessfulIngestionAt` as null and still returns 200 while the database is reachable

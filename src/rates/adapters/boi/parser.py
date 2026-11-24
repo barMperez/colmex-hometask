@@ -110,42 +110,38 @@ def build_observations(
 ) -> list[RateObservation]:
     """Validate the snapshot for the enabled pairs and build observations.
 
-    Raises ``SnapshotRejected`` if any enabled pair is missing or invalid, if the
-    entries disagree on ``lastUpdate``, or if the publication date is in the future.
+    Each entry keeps its own ``lastUpdate`` and publication date, so BoI may correct a
+    single currency. Raises ``SnapshotRejected`` if any enabled pair is missing or
+    invalid, or if any enabled entry's publication date is in the future.
     """
     if not enabled_pairs:
         raise SnapshotRejected("No enabled currency pairs configured")
 
-    sources: list[tuple[CurrencyPair, SourceRate]] = []
+    observations: list[RateObservation] = []
     for pair in enabled_pairs:
         if pair.quote != BOI_QUOTE_CURRENCY:
             raise SnapshotRejected(f"BoI only quotes against ILS; cannot serve {pair.base}/{pair.quote}")
         entry = snapshot.entries.get(pair.source_key.upper())
         if entry is None:
             raise SnapshotRejected(f"Snapshot is missing enabled currency {pair.source_key}")
-        sources.append((pair, _source_rate(pair.source_key, entry)))
-
-    timestamps = {source.last_update for _, source in sources}
-    if len(timestamps) != 1:
-        raise SnapshotRejected("Entries disagree on lastUpdate")
-    last_update = timestamps.pop()
-    published = publication_date_of(last_update)
-    if published > today_local:
-        raise SnapshotRejected(
-            f"Publication date {published} is after today ({today_local}) in Asia/Jerusalem"
+        source = _source_rate(pair.source_key, entry)
+        published = publication_date_of(source.last_update)
+        if published > today_local:
+            raise SnapshotRejected(
+                f"{pair.source_key}: publication date {published} is after today "
+                f"({today_local}) in Asia/Jerusalem"
+            )
+        observations.append(
+            RateObservation(
+                id=uuid4(),
+                base_currency=pair.base,
+                quote_currency=pair.quote,
+                rate=normalise(source.rate, source.unit),
+                source_rate=source.rate,
+                source_unit=source.unit,
+                publication_date=published,
+                source_last_update=source.last_update,
+                retrieved_at=retrieved_at,
+            )
         )
-
-    return [
-        RateObservation(
-            id=uuid4(),
-            base_currency=pair.base,
-            quote_currency=pair.quote,
-            rate=normalise(source.rate, source.unit),
-            source_rate=source.rate,
-            source_unit=source.unit,
-            publication_date=published,
-            source_last_update=last_update,
-            retrieved_at=retrieved_at,
-        )
-        for pair, source in sources
-    ]
+    return observations

@@ -124,7 +124,7 @@ Supported pairs: `USD/ILS`, `EUR/ILS`, `GBP/ILS` (`1 base = rate quote`). Codes 
 
 **Read flow** (`GET /api/v1/exchange-rates`): validate codes (400), then check the pair is enabled (422), then load the active policy and calendar (503 if missing), then load the latest observation (404 if none), then `evaluate(...)` and return 200. **BoI is never called on the read path**, so BoI outages don't affect reads; they only stop new data arriving.
 
-**Refresh flow**: every 5 min on business days 12:00–18:00 Israel time, hourly otherwise. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates the **whole** snapshot: all enabled pairs present, rate > 0, unit is a positive integer, a consistent `lastUpdate`, and a publication date not in the future. Then it inserts in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and writes one audit event only if anything new was stored. A failed or rejected fetch changes nothing.
+**Refresh flow**: every 5 min on business days 12:00–18:00 Israel time, hourly otherwise. Each run fetches with a timeout and bounded retries (exponential backoff and jitter). It parses numbers directly into `Decimal` and validates the **whole** snapshot: all enabled pairs present, rate > 0, unit is a positive integer, and no publication date in the future. Each currency keeps its own `lastUpdate`, so a BoI correction to one currency stores just that currency. Then it inserts in **one transaction** with `ON CONFLICT DO NOTHING` on `(pair, source lastUpdate)`, and writes one audit event only if anything new was stored. A failed or rejected fetch changes nothing.
 
 **Code layout**
 
@@ -155,6 +155,8 @@ ELIGIBLE      = publicationDate >= required(now)
                 AND publicationDate is at most max_age_days old
 ```
 
+Checks run in this order: future-dated (`INVALID_PUBLICATION_DATE`) → older than the cap (`MAX_AGE_EXCEEDED`) → no `required(now)` within the cap (503, see below) → older than `required(now)` (`PUBLICATION_OVERDUE`).
+
 Policy v1: grace **45 min**, max age **7 days**. These are assumptions, not BoI rules (see §6).
 
 **Worked examples** (each one is a row in [`tests/unit/test_eligibility.py`](tests/unit/test_eligibility.py)):
@@ -169,8 +171,13 @@ Policy v1: grace **45 min**, max age **7 days**. These are assumptions, not BoI 
 | Wed 02/12 16:30, BoI unexpectedly silent | Tue 01/12 | Wed 02/12 | NOT_ELIGIBLE until an operator declares 02/12 (below) |
 | Tue 07/04 10:00 (Pesach) | Tue 31/03 | Tue 31/03 | ELIGIBLE (7 days old, within the cap) |
 | Any time in 2028 with no 2028 calendar loaded | n/a | n/a | **503 `POLICY_NOT_EVALUABLE`**: fails closed |
+| Thu 26/11 18:00, calendar wrongly lists 17/11–26/11 | Mon 16/11 | none | NOT_ELIGIBLE, `MAX_AGE_EXCEEDED` (cap checked first) |
+| Thu 26/11 18:00, same wrong calendar | Wed 25/11 | none | **503 `POLICY_NOT_EVALUABLE`**: calendar is implausible |
 
-**Fail closed.** If the calendar for a year the evaluation needs is not loaded, or no active policy exists, the API refuses to assess eligibility (503) rather than guess.
+**Fail closed.** The API refuses to assess eligibility (503) rather than guess when:
+- the calendar for a year the evaluation needs is not loaded;
+- no active policy exists;
+- the calendar leaves no business day within the max age, which means the calendar data is wrong.
 
 ### Operator action: declaring an unexpected non-publication day
 
@@ -211,7 +218,7 @@ The full design record, including the alternatives considered, is in [`openspec/
 ## 6. Assumptions and limitations
 
 - **Grace 45 minutes and max age 7 days are assumptions, not BoI rules.** BoI says rates are published "soon after 15:15" but "the time is not fixed". Observed publications are a few minutes after 15:15. Both values live in the versioned `policies` table (v1).
-- **The BoI calendar must be loaded every year.** Seeded for 2026–2027 from BoI's official PDF. From 2028-01-01 the API returns `503 POLICY_NOT_EVALUABLE` (by design) until a migration adds the 2028 list and a `calendar_coverage` row. Walking back from early January also needs the previous year.
+- **The BoI calendar must be loaded every year.** Seeded for 2026–2027 from BoI's official PDF. From 2028-01-01 the API returns `503 POLICY_NOT_EVALUABLE` (by design) until a migration adds the 2028 list and a `calendar_coverage` row. Walking back from early January also needs the previous year. A calendar that leaves no business day within the 7-day cap is also treated as bad data: reads of a recent rate return 503 `POLICY_NOT_EVALUABLE` (logged at error level) until the calendar is corrected.
 - **Holiday eves with an early (12:15) publication are not modelled.** The calendar only lists days with *no* publication. On a Mon–Thu holiday eve the previous rate stays eligible until 16:00 instead of 13:00. The refresh process still ingests the new rate as soon as it appears.
 - **Ingestion lag.** Between BoI publishing and our next poll (≤ 5 min in the window) the API serves the previous rate, which is still eligible until the deadline.
 - **BoI may change its payload shape.** Whole-snapshot validation rejects anything unexpected, the last good data is kept, and the failure is logged. Reads turn `NOT_ELIGIBLE` after the next deadline, which is the visible signal.
@@ -220,7 +227,11 @@ The full design record, including the alternatives considered, is in [`openspec/
 - **Representative rates are not trade prices** (see §1).
 - **No stated load or SLO requirements** were given. Reads are a few indexed queries over a tiny dataset; the API scales horizontally (`API_WORKERS`, more replicas). The refresh process must stay single-instance (correctness doesn't depend on it, efficiency does).
 - **Security:** assumed internal network use. There is no authentication on the read API. The operator action is a script with DB access, not an HTTP endpoint. Compose credentials are for local development only.
-- **Health:** `/health/live` checks the process; `/health/ready` checks the database and reports `latestRetrievedAt`. Freshness is reported per read via `eligibility`, not via readiness, so an old rate doesn't take the API out of rotation.
+- **Health:** `/health/live` checks the process. `/health/ready` checks the database and reports two times:
+  - `latestRetrievedAt`: when the newest stored rate was fetched.
+  - `lastSuccessfulIngestionAt`: when the refresh process last completed a successful poll, including polls that found nothing new. Null until the first success.
+
+  The refresh process records each attempt in a one-row `refresh_status` table, so the API can report this without talking to the refresh process. Freshness is reported per read via `eligibility`, not via readiness, so an old rate or a stalled refresh doesn't take the API out of rotation: alert on `lastSuccessfulIngestionAt` instead.
 
 ## 7. Running without Docker, tests, failure simulation
 
@@ -259,17 +270,14 @@ BOI_URL=http://127.0.0.1:9/unreachable python -m rates.refresh
 # logs: refresh.attempt outcome=boi_unavailable consecutive_failures=1 ...
 ```
 
-With compose: `docker compose stop refresh`, then `docker compose run --rm -e BOI_URL=http://127.0.0.1:9/x refresh`. Existing data is untouched. Reads keep returning the stored rate, which becomes `NOT_ELIGIBLE` once the next deadline passes.
+With compose: `docker compose stop refresh`, then `docker compose run --rm -e BOI_URL=http://127.0.0.1:9/x refresh`. Existing data is untouched. Reads keep returning the stored rate, which becomes `NOT_ELIGIBLE` once the next deadline passes. `/health/ready` keeps reporting the earlier `lastSuccessfulIngestionAt`, so an alert on its age catches the outage before any deadline does.
 
 **Operator script**: see §4.
 
 **End-to-end smoke run** (`docker compose up --build`, Tue 2026-11-24 13:45 Israel time, live BoI):
 
 ```text
-refresh-1 | refresh.attempt outcome=success inserted=3 publication_date=2026-11-23 source_last_update=2026-11-23T13:21:10.710489+00:00 duration_ms=194
-
-$ curl localhost:8000/health/ready
-{"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T11:45:58.922261Z"}
+refresh-1 | refresh.attempt outcome=success inserted=3 latest_publication_date=2026-11-23 latest_source_last_update=2026-11-23T13:21:10.710489+00:00 duration_ms=194
 
 $ curl "localhost:8000/api/v1/exchange-rates?base=USD&quote=ILS"
 {"rateId":"c2726261-6e4f-4692-8c33-b039a7f8b13b","baseCurrency":"USD","quoteCurrency":"ILS","rate":"3.343","publicationDate":"2026-11-23","eligibility":{"status":"ELIGIBLE","reason":null,"requiredPublicationDate":"2026-11-23","evaluatedAt":"2026-11-24T11:46:06.203451Z","policyVersion":1},"source":{"name":"BANK_OF_ISRAEL","type":"REPRESENTATIVE","lastUpdate":"2026-11-23T13:21:10.710489Z","rate":"3.343","unit":1},"retrievedAt":"2026-11-24T11:45:58.922261Z"}
@@ -279,6 +287,22 @@ $ curl "localhost:8000/api/v1/exchange-rates?base=US1&quote=ILS"     # 400 INVAL
 ```
 
 With the refresh process pointed at an unreachable BoI URL, the log shows `outcome=boi_unavailable` and the read above returns the same `rateId`, still `ELIGIBLE`.
+
+**Readiness across a quiet poll and an outage** (same day, 14:53 Israel time, after a redeploy that applied migration `0003`). BoI had nothing new, so the poll stored nothing but still counts as a success:
+
+```text
+refresh-1 | refresh.attempt outcome=success inserted=0 latest_publication_date=2026-11-23 latest_source_last_update=2026-11-23T13:21:10.710489+00:00 duration_ms=189 last_success_at=2026-11-24T12:53:12.084627+00:00
+
+$ curl localhost:8000/health/ready
+{"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T11:45:58.922261Z","lastSuccessfulIngestionAt":"2026-11-24T12:53:12.084627Z"}
+
+# refresh restarted with BOI_URL=http://127.0.0.1:9/x
+refresh   | refresh.started url=http://127.0.0.1:9/x last_success_at=2026-11-24T12:53:12.084627+00:00
+refresh   | refresh.attempt outcome=boi_unavailable consecutive_failures=1 last_success_at=2026-11-24T12:53:12.084627+00:00 ...
+
+$ curl localhost:8000/health/ready     # unchanged: a failure never moves the last success
+{"status":"ready","database":"ok","latestRetrievedAt":"2026-11-24T11:45:58.922261Z","lastSuccessfulIngestionAt":"2026-11-24T12:53:12.084627Z"}
+```
 
 ## 8. Out of scope and possible extensions
 

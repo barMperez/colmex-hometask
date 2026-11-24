@@ -17,6 +17,7 @@ from rates.adapters.db.repos import (
     SqlPairRepository,
     SqlPolicyRepository,
     SqlRateRepository,
+    SqlRefreshStatusRepository,
 )
 from rates.clock import Clock
 from rates.domain.eligibility import evaluate
@@ -35,6 +36,7 @@ class RateView:
 @dataclass(frozen=True)
 class Readiness:
     latest_retrieved_at: datetime | None
+    last_successful_ingestion_at: datetime | None
 
 
 class RateQueryService:
@@ -62,6 +64,8 @@ class RateQueryService:
     async def readiness(self) -> Readiness:
         try:
             async with self._engine.connect() as conn:
-                return Readiness(await SqlRateRepository(conn).latest_retrieved_at())
+                latest = await SqlRateRepository(conn).latest_retrieved_at()
+                status = await SqlRefreshStatusRepository(conn).get()
+            return Readiness(latest, status.last_success_at)
         except STORAGE_ERRORS as exc:
             raise StorageUnavailable("Rate storage is unavailable") from exc

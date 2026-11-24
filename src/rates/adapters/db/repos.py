@@ -7,7 +7,7 @@ several repositories can take part in one atomic unit of work.
 from collections.abc import Sequence
 from datetime import date, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -18,10 +18,11 @@ from rates.adapters.db.tables import (
     non_publication_days,
     policies,
     rate_observations,
+    refresh_status,
 )
 from rates.adapters.db.types import insert_ignore
 from rates.domain.calendar import CalendarView
-from rates.domain.models import AuditEvent, CurrencyPair, Policy, RateObservation
+from rates.domain.models import AuditEvent, CurrencyPair, Policy, RateObservation, RefreshStatus
 
 
 class SqlPairRepository:
@@ -175,3 +176,44 @@ def _from_observation(obs: RateObservation) -> dict[str, object]:
         "source_last_update": obs.source_last_update,
         "retrieved_at": obs.retrieved_at,
     }
+
+
+class SqlRefreshStatusRepository:
+    """The single ``refresh_status`` row (id = 1), seeded by migration 0003."""
+
+    _ROW = refresh_status.c.id == 1
+
+    def __init__(self, conn: AsyncConnection) -> None:
+        self._conn = conn
+
+    async def get(self) -> RefreshStatus:
+        row = (await self._conn.execute(select(refresh_status).where(self._ROW))).mappings().first()
+        if row is None:
+            return RefreshStatus()
+        return RefreshStatus(
+            last_attempt_at=row["last_attempt_at"],
+            last_attempt_outcome=row["last_attempt_outcome"],
+            last_success_at=row["last_success_at"],
+            consecutive_failures=row["consecutive_failures"],
+        )
+
+    async def record_success(self, at: datetime) -> bool:
+        """Returns False if the row is missing (nothing was written)."""
+        return await self._update(
+            last_attempt_at=at,
+            last_attempt_outcome="success",
+            last_success_at=at,
+            consecutive_failures=0,
+        )
+
+    async def record_failure(self, at: datetime, outcome: str, consecutive_failures: int) -> bool:
+        """Records a failed attempt; ``last_success_at`` is left as it was."""
+        return await self._update(
+            last_attempt_at=at,
+            last_attempt_outcome=outcome,
+            consecutive_failures=consecutive_failures,
+        )
+
+    async def _update(self, **values) -> bool:
+        result = await self._conn.execute(update(refresh_status).where(self._ROW).values(**values))
+        return result.rowcount == 1

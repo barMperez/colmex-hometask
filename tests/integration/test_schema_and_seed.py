@@ -5,7 +5,13 @@ from alembic import command
 from sqlalchemy import func, inspect, select, text
 
 from rates.adapters.db.session import create_engine
-from rates.adapters.db.tables import calendar_coverage, currency_pairs, non_publication_days, policies
+from rates.adapters.db.tables import (
+    calendar_coverage,
+    currency_pairs,
+    non_publication_days,
+    policies,
+    refresh_status,
+)
 from tests.conftest import alembic_config, is_postgres
 
 
@@ -30,7 +36,7 @@ async def _table_names(url: str) -> set[str]:
 async def test_upgrade_downgrade_upgrade(migrated_url):
     expected = {
         "currency_pairs", "rate_observations", "non_publication_days",
-        "calendar_coverage", "policies", "audit_events",
+        "calendar_coverage", "policies", "audit_events", "refresh_status",
     }
     assert expected <= await _table_names(migrated_url)
 
@@ -62,6 +68,7 @@ async def test_seed_data(engine):
             select(func.count()).where(non_publication_days.c.day.between(date(2027, 1, 1), date(2027, 12, 31)))
         )).scalar_one()
         years = (await conn.execute(select(calendar_coverage.c.year).order_by(calendar_coverage.c.year))).scalars().all()
+        status = (await conn.execute(select(refresh_status))).mappings().all()
 
     assert [tuple(p) for p in pairs] == [("EUR", "ILS", True), ("GBP", "ILS", True), ("USD", "ILS", True)]
     assert len(active) == 1
@@ -73,3 +80,12 @@ async def test_seed_data(engine):
     assert days_2026 == 16
     assert days_2027 == 13
     assert years == [2026, 2027]
+    assert [dict(r) for r in status] == [
+        {
+            "id": 1,
+            "last_attempt_at": None,
+            "last_attempt_outcome": None,
+            "last_success_at": None,
+            "consecutive_failures": 0,
+        }
+    ]

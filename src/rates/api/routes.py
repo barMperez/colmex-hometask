@@ -55,10 +55,13 @@ async def live() -> dict[str, str]:
 @router.get(
     "/health/ready",
     response_model=ReadinessOut,
-    summary="Database reachable; reports the latest ingestion time",
+    summary="Database reachable; reports the latest retrieval and last successful ingestion",
     tags=["health"],
     responses={503: problem_openapi("STORAGE_UNAVAILABLE")},
 )
 async def ready(service: Annotated[RateQueryService, Depends(get_service)]) -> ReadinessOut:
     readiness = await service.readiness()
-    return ReadinessOut(latest_retrieved_at=readiness.latest_retrieved_at)
+    return ReadinessOut(
+        latest_retrieved_at=readiness.latest_retrieved_at,
+        last_successful_ingestion_at=readiness.last_successful_ingestion_at,
+    )

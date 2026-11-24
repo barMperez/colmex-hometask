@@ -3,7 +3,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 
 from rates.adapters.db.repos import (
@@ -11,8 +11,9 @@ from rates.adapters.db.repos import (
     SqlPairRepository,
     SqlPolicyRepository,
     SqlRateRepository,
+    SqlRefreshStatusRepository,
 )
-from rates.adapters.db.tables import currency_pairs, policies
+from rates.adapters.db.tables import currency_pairs, policies, refresh_status
 from rates.domain.models import RateObservation
 
 
@@ -96,3 +97,48 @@ async def test_calendar_view(engine):
     assert view.covered_years == {2026, 2027}
     assert date(2026, 10, 27) in view.non_publication_days
     assert not view.is_business_day(date(2026, 10, 27))
+
+
+# --- Refresh status ---------------------------------------------------------
+
+T1 = datetime(2026, 11, 24, 9, 0, tzinfo=UTC)
+T2 = datetime(2026, 11, 24, 9, 5, tzinfo=UTC)
+
+
+async def test_refresh_status_success_then_failure(engine):
+    async with engine.begin() as conn:
+        repo = SqlRefreshStatusRepository(conn)
+        assert await repo.record_success(T1)
+    async with engine.begin() as conn:
+        assert await SqlRefreshStatusRepository(conn).record_failure(T2, "boi_unavailable", 1)
+    async with engine.connect() as conn:
+        status = await SqlRefreshStatusRepository(conn).get()
+
+    assert status.last_attempt_at == T2
+    assert status.last_attempt_outcome == "boi_unavailable"
+    assert status.last_success_at == T1  # a failure never moves the last success
+    assert status.consecutive_failures == 1
+
+
+async def test_refresh_status_success_resets_failures(engine):
+    async with engine.begin() as conn:
+        repo = SqlRefreshStatusRepository(conn)
+        await repo.record_failure(T1, "snapshot_rejected", 3)
+        await repo.record_success(T2)
+        status = await repo.get()
+
+    assert status.last_success_at == T2
+    assert status.last_attempt_outcome == "success"
+    assert status.consecutive_failures == 0
+
+
+async def test_refresh_status_missing_row_reads_empty(engine):
+    async with engine.begin() as conn:
+        await conn.execute(delete(refresh_status))
+        repo = SqlRefreshStatusRepository(conn)
+        assert await repo.record_success(T1) is False
+        status = await repo.get()
+
+    assert status.last_success_at is None
+    assert status.last_attempt_at is None
+    assert status.consecutive_failures == 0

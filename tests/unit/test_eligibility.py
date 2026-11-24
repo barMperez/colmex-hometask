@@ -189,6 +189,23 @@ def test_required_date_in_unloaded_year_fails_closed():
         evaluate(observation(date(2026, 12, 31)), il(2027, 1, 4, 9, 0), only_2027, POLICY)
 
 
+CALENDAR_GAP = CalendarView(
+    frozenset(date(2026, 11, 17) + timedelta(days=i) for i in range(10)),
+    frozenset({2026}),
+)
+
+
+def test_no_business_day_within_max_age_fails_closed():
+    # Same wrong calendar as the max-age case, but a recent observation.
+    with pytest.raises(PolicyNotEvaluable, match="non-publication calendar"):
+        evaluate(observation(date(2026, 11, 25)), il(2026, 11, 26, 18, 0), CALENDAR_GAP, POLICY)
+
+
+def test_calendar_gap_still_reports_future_dated_observation():
+    result = evaluate(observation(date(2026, 11, 27)), il(2026, 11, 26, 18, 0), CALENDAR_GAP, POLICY)
+    assert result.reason is EligibilityReason.INVALID_PUBLICATION_DATE
+
+
 def test_evaluate_rejects_naive_now():
     with pytest.raises(ValueError):
         evaluate(observation(date(2026, 11, 23)), datetime(2026, 11, 24, 10), CALENDAR, POLICY)

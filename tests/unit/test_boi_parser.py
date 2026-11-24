@@ -95,11 +95,32 @@ def test_structurally_malformed_payload_rejected(payload):
         build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
 
 
-def test_inconsistent_last_update_rejected():
+def test_differing_last_update_accepted_per_entry():
     payload = load("snapshot_2026-11-23.json")
-    payload["exchangeRates"][0]["lastUpdate"] = "2026-11-23T14:00:00Z"  # USD only
-    with pytest.raises(SnapshotRejected):
+    payload["exchangeRates"][0]["lastUpdate"] = "2026-11-23T14:05:00Z"  # USD only
+    observations = {
+        o.base_currency: o
+        for o in build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+    }
+
+    assert observations["USD"].source_last_update == datetime(2026, 11, 23, 14, 5, tzinfo=UTC)
+    assert observations["EUR"].source_last_update == datetime(
+        2026, 11, 23, 13, 21, 10, 710489, tzinfo=UTC
+    )
+    assert {o.publication_date for o in observations.values()} == {date(2026, 11, 23)}
+
+
+def test_single_future_dated_entry_rejects_snapshot():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][1]["lastUpdate"] = "2026-11-25T10:00:00Z"  # GBP only
+    with pytest.raises(SnapshotRejected, match="GBP"):
         build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)
+
+
+def test_future_dated_entry_of_disabled_currency_is_ignored():
+    payload = load("snapshot_2026-11-23.json")
+    payload["exchangeRates"][2]["lastUpdate"] = "2026-11-25T10:00:00Z"  # JPY: not enabled
+    assert len(build_observations(parse_payload(payload), PAIRS, TODAY, RETRIEVED)) == 3
 
 
 @pytest.mark.parametrize("unit", [0, -1, "1", True, Decimal("1.5")])

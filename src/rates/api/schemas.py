@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, PlainSerializer, WithJsonSchema
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, WithJsonSchema
 from pydantic.alias_generators import to_camel
 
 from rates.domain.decimals import decimal_to_plain_string
@@ -96,4 +96,12 @@ class ExchangeRateOut(CamelModel):
 class ReadinessOut(CamelModel):
     status: Literal["ready"] = "ready"
     database: Literal["ok"] = "ok"
-    latest_retrieved_at: UtcInstant | None
+    latest_retrieved_at: UtcInstant | None = Field(
+        description="When the most recent stored rate observation was retrieved from BoI."
+    )
+    last_successful_ingestion_at: UtcInstant | None = Field(
+        description=(
+            "When the refresh process last completed a successful ingestion, including "
+            "polls that found nothing new. Null until the first success."
+        )
+    )

@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from rates.adapters.boi.client import BoiFetchError
+from rates.adapters.db.repos import SqlRefreshStatusRepository
 from rates.adapters.db.tables import rate_observations
 from rates.clock import FixedClock
 from rates.domain.models import BOI_TIMEZONE
@@ -93,3 +94,63 @@ async def test_run_forever_uses_window_interval_and_stops(engine):
 
     assert source.calls == 2
     assert sleeps == [300, 300]  # Monday 15:25 Israel: inside the publication window
+
+
+# --- Durable refresh status ---------------------------------------------------
+
+async def read_status(engine):
+    async with engine.connect() as conn:
+        return await SqlRefreshStatusRepository(conn).get()
+
+
+async def test_status_records_success_failure_and_duplicate(engine):
+    loop = make_loop(
+        engine,
+        ScriptedSource(
+            "snapshot_2026-11-23.json", BoiFetchError("timeout"), "snapshot_2026-11-23.json"
+        ),
+    )
+
+    assert await loop.run_once() is True
+    status = await read_status(engine)
+    assert status.last_success_at == NOW
+    assert status.last_attempt_at == NOW
+    assert status.last_attempt_outcome == "success"
+
+    assert await loop.run_once() is False
+    status = await read_status(engine)
+    assert status.last_attempt_outcome == "boi_unavailable"
+    assert status.consecutive_failures == 1
+    assert status.last_success_at == NOW  # a failure never moves the last success
+
+    assert await loop.run_once() is True  # duplicate snapshot: nothing new, still a success
+    status = await read_status(engine)
+    assert status.last_attempt_outcome == "success"
+    assert status.consecutive_failures == 0
+
+
+async def test_failing_status_write_keeps_loop_and_rates(engine, monkeypatch, caplog):
+    class BrokenStatusRepo(SqlRefreshStatusRepository):
+        async def _update(self, **values):
+            raise RuntimeError("disk full")
+
+    monkeypatch.setattr("rates.refresh.loop.SqlRefreshStatusRepository", BrokenStatusRepo)
+    loop = make_loop(engine, ScriptedSource("snapshot_2026-11-23.json", BoiFetchError("x")))
+
+    with caplog.at_level(logging.WARNING, logger="rates.refresh.loop"):
+        assert await loop.run_once() is True
+        assert await loop.run_once() is False
+    assert caplog.text.count("refresh.status_write_failed") == 2
+    assert len(await snapshot_rows(engine)) == 3  # ingested rates are untouched
+    assert (await read_status(engine)).last_success_at is None
+
+
+async def test_restore_status_on_startup(engine):
+    earlier = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+    async with engine.begin() as conn:
+        await SqlRefreshStatusRepository(conn).record_success(earlier)
+
+    loop = make_loop(engine, ScriptedSource())
+    await loop.restore_status()
+
+    assert loop.last_success_at == earlier

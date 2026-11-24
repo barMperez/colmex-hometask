@@ -26,8 +26,10 @@ class SnapshotSource(Protocol):
 @dataclass(frozen=True)
 class IngestionResult:
     inserted: int
-    publication_date: date
-    source_last_update: datetime
+    latest_publication_date: date
+    """Latest publication date across the snapshot's enabled entries."""
+    latest_source_last_update: datetime
+    """Latest BoI ``lastUpdate`` across the snapshot's enabled entries."""
 
 
 class IngestionService:
@@ -51,25 +53,34 @@ class IngestionService:
             pairs = await SqlPairRepository(conn).enabled_pairs()
             observations = build_observations(snapshot, pairs, today_local, retrieved_at)
             inserted = await SqlRateRepository(conn).insert_many(observations)
-            first = observations[0]
             if inserted:
+                ingestion_id = uuid4()
                 await SqlAuditRepository(conn).record(
                     AuditEvent(
-                        id=uuid4(),
+                        id=ingestion_id,
                         occurred_at=retrieved_at,
                         actor=ACTOR,
                         event_type=EVENT_RATES_INGESTED,
-                        entity_type="rate_snapshot",
-                        entity_id=first.source_last_update.isoformat(),
+                        entity_type="rate_ingestion",
+                        entity_id=str(ingestion_id),
                         before=None,
                         after={
-                            "publication_date": first.publication_date.isoformat(),
-                            "source_last_update": first.source_last_update.isoformat(),
-                            "pairs": [f"{o.base_currency}/{o.quote_currency}" for o in inserted],
-                            "observation_ids": [str(o.id) for o in inserted],
+                            "observations": [
+                                {
+                                    "pair": f"{o.base_currency}/{o.quote_currency}",
+                                    "id": str(o.id),
+                                    "source_last_update": o.source_last_update.isoformat(),
+                                    "publication_date": o.publication_date.isoformat(),
+                                }
+                                for o in inserted
+                            ],
                         },
                         reason=None,
                     )
                 )
 
-        return IngestionResult(len(inserted), first.publication_date, first.source_last_update)
+        return IngestionResult(
+            inserted=len(inserted),
+            latest_publication_date=max(o.publication_date for o in observations),
+            latest_source_last_update=max(o.source_last_update for o in observations),
+        )

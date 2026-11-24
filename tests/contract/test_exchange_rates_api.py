@@ -1,7 +1,7 @@
 """Contract tests for specs/exchange-rate-query, through the real ASGI app and database."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -9,8 +9,9 @@ import pytest
 import respx
 from sqlalchemy import update
 
+from rates.adapters.db.repos import SqlRefreshStatusRepository
 from rates.adapters.db.session import create_engine
-from rates.adapters.db.tables import currency_pairs
+from rates.adapters.db.tables import currency_pairs, non_publication_days
 from rates.api.app import create_app
 from rates.clock import FixedClock
 from rates.domain.models import BOI_TIMEZONE
@@ -167,6 +168,34 @@ async def test_policy_not_evaluable_returns_no_rate(engine, make_client):
     assert "rate" not in body
 
 
+async def test_calendar_gap_returns_policy_not_evaluable(engine, make_client):
+    # Implausible calendar: every day 2026-11-17..26 listed as non-publication.
+    await ingest(engine, "snapshot_2026-11-25.json", at=il(2026, 11, 25, 15, 25))
+    async with engine.begin() as conn:
+        await conn.execute(
+            non_publication_days.insert(),
+            [
+                {
+                    "day": date(2026, 11, 17) + timedelta(days=i),
+                    "reason": "test: wrong calendar",
+                    "origin": "OPERATOR",
+                    "created_by": "test",
+                    "created_at": il(2026, 11, 26, 9, 0),
+                }
+                for i in range(10)
+            ],
+        )
+    client = await make_client(engine, il(2026, 11, 26, 18, 0))
+
+    response = await get(client, "base=USD&quote=ILS")
+
+    assert response.status_code == 503
+    assert response.headers["content-type"] == PROBLEM
+    body = response.json()
+    assert body["code"] == "POLICY_NOT_EVALUABLE"
+    assert "rate" not in body
+
+
 async def test_storage_unavailable(tmp_path, make_client):
     missing = (tmp_path / "no-such-dir" / "rates.db").as_posix()
     broken = create_engine(f"sqlite+aiosqlite:///{missing}")
@@ -201,6 +230,30 @@ async def test_health(engine, make_client):
     ready = (await client.get("/health/ready")).json()
     assert ready["status"] == "ready"
     assert ready["latestRetrievedAt"] == "2026-11-23T13:25:00Z"
+
+
+async def test_readiness_reports_last_successful_ingestion(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 11, 0))
+    ready = await client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json()["lastSuccessfulIngestionAt"] is None  # no success yet
+
+    await ingest(engine)  # stored at 2026-11-23 13:25Z
+    async with engine.begin() as conn:  # a later successful poll that found nothing new
+        await SqlRefreshStatusRepository(conn).record_success(il(2026, 11, 24, 11, 0))
+        await SqlRefreshStatusRepository(conn).record_failure(il(2026, 11, 24, 11, 5), "boi_unavailable", 1)
+
+    ready = (await client.get("/health/ready")).json()
+    assert ready["lastSuccessfulIngestionAt"] == "2026-11-24T09:00:00Z"
+    assert ready["latestRetrievedAt"] == "2026-11-23T13:25:00Z"
+
+
+async def test_openapi_documents_readiness_fields(engine, make_client):
+    client = await make_client(engine, il(2026, 11, 24, 10, 0))
+    spec = (await client.get("/openapi.json")).json()
+    props = spec["components"]["schemas"]["ReadinessOut"]["properties"]
+    assert "lastSuccessfulIngestionAt" in props
+    assert props["lastSuccessfulIngestionAt"]["description"]
 
 
 async def test_openapi_marks_eligibility_required(engine, make_client):

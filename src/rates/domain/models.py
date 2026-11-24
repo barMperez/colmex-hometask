@@ -103,3 +103,13 @@ def _require_decimal(name: str, value: object) -> None:
 def _require_aware(name: str, value: datetime) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
+
+
+@dataclass(frozen=True)
+class RefreshStatus:
+    """What the refresh process last recorded; all fields empty before its first attempt."""
+
+    last_attempt_at: datetime | None = None
+    last_attempt_outcome: str | None = None
+    last_success_at: datetime | None = None
+    consecutive_failures: int = 0

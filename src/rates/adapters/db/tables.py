@@ -121,3 +121,15 @@ audit_events = Table(
     Column("after", JsonDocument, nullable=True),
     Column("reason", Text, nullable=True),
 )
+
+refresh_status = Table(
+    "refresh_status",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=False),
+    Column("last_attempt_at", UtcDateTime, nullable=True),
+    Column("last_attempt_outcome", String(32), nullable=True),
+    Column("last_success_at", UtcDateTime, nullable=True),
+    Column("consecutive_failures", Integer, nullable=False, server_default=text("0")),
+    CheckConstraint("id = 1", name="single_row"),
+)
+"""One row (id = 1), written by the refresh process after every attempt."""
