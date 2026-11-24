@@ -66,16 +66,30 @@ The system SHALL store, for each observation, the source rate and source unit as
 - **THEN** the normalised rate is 0.021026
 
 ### Requirement: Publication date derivation
-The system SHALL derive each observation's publication date by converting that entry's own source `lastUpdate` timestamp to a calendar date in Asia/Jerusalem. It SHALL also store that source timestamp itself.
+The system SHALL store each entry's own source `lastUpdate` timestamp and SHALL attribute the observation to a publication date as follows. When `lastUpdate`, in Asia/Jerusalem, falls on a business day at or after that day's expected publication time under the active policy, the publication date SHALL be that day (a publication or a same-day correction). Any other `lastUpdate` (before the expected time, or on a weekend or non-publication day) is a restatement of an earlier rate: the observation SHALL keep the publication date of the pair's current stored observation, capped at the latest business day whose expected publication time is at or before `lastUpdate`. A restatement with no stored observation for the pair SHALL be rejected for that currency. When the calendar does not cover the days needed, the snapshot SHALL be rejected.
 
-#### Scenario: UTC timestamp converted to Israel date
-- **WHEN** BoI returns `lastUpdate` 2026-11-23T13:21:10.7104898Z
+Rationale: BoI's API has no date field and `lastUpdate` moves whenever BoI touches an entry. Using its calendar date would make a morning restatement of yesterday's rate count as today's publication, and the stale rate would be ELIGIBLE after today's deadline.
+
+#### Scenario: Publication inside the window
+- **WHEN** BoI returns `lastUpdate` 2026-11-23T13:21:10.7104898Z (Monday 15:21 Israel time)
 - **THEN** the observation's publication date is 2026-11-23
 - **AND** the stored source timestamp is 2026-11-23T13:21:10.7104898Z (at least millisecond precision)
 
-#### Scenario: Late UTC evening maps to next Israel date
-- **WHEN** BoI returns `lastUpdate` 2026-11-23T22:30:00Z
-- **THEN** the observation's publication date is 2026-11-24
+#### Scenario: Morning restatement keeps the earlier date
+- **GIVEN** the current USD/ILS observation has publication date 2026-11-23
+- **WHEN** BoI returns USD with `lastUpdate` 2026-11-24T08:00:00Z (Tuesday 10:00 Israel time)
+- **THEN** the observation's publication date is 2026-11-23
+- **AND** at Tuesday 16:01 with no further publication it is NOT_ELIGIBLE with reason PUBLICATION_OVERDUE
+
+#### Scenario: Restatement after a missed day
+- **GIVEN** the current USD/ILS observation has publication date Monday 2026-11-23 and BoI published nothing on Tuesday
+- **WHEN** BoI returns USD with `lastUpdate` Wednesday 2026-11-25 09:00 Israel time
+- **THEN** the observation's publication date is 2026-11-23, not Tuesday
+
+#### Scenario: Restatement with nothing stored
+- **GIVEN** no USD/ILS observation is stored
+- **WHEN** BoI returns USD with `lastUpdate` Tuesday 2026-11-24 10:00 Israel time
+- **THEN** USD is rejected with its reason and the other currencies are processed
 
 #### Scenario: Entries with different timestamps
 - **WHEN** a snapshot has USD with `lastUpdate` 2026-11-23T14:05:00Z and EUR with `lastUpdate` 2026-11-23T13:21:10Z

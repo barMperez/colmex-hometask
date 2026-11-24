@@ -209,3 +209,37 @@ async def test_identical_reingest_logs_no_correction(engine, caplog):
     assert again.inserted == 0 and again.corrections == []
     assert "same_timestamp_correction" not in caplog.text
     assert await count(engine, audit_events) == 1
+
+
+async def test_morning_restatement_does_not_make_a_stale_rate_eligible(engine):
+    """Regression: publicationDate was the calendar date of BoI's lastUpdate.
+
+    Monday's rate is ingested; on Tuesday at 10:00 Israel time BoI re-stamps USD
+    (new lastUpdate, same value) and never publishes Tuesday's rate. After Tuesday's
+    16:00 deadline the rate must be PUBLICATION_OVERDUE, not ELIGIBLE.
+    """
+    from rates.domain.models import EligibilityReason, EligibilityStatus
+    from rates.services.rate_query import RateQueryService
+
+    await service(engine, "snapshot_2026-11-23.json").run_once()
+
+    restated = json.loads(boi_fixture("snapshot_2026-11-23.json"), parse_float=Decimal)
+    restated["exchangeRates"][0]["lastUpdate"] = "2026-11-24T08:00:00Z"  # USD, Tue 10:00 IL
+
+    class Restated:
+        async def fetch(self):
+            return restated
+
+    tuesday_morning = FixedClock(datetime(2026, 11, 24, 8, 5, tzinfo=UTC))
+    result = await IngestionService(engine, Restated(), tuesday_morning).run_once()
+    assert result.rejected == []
+    assert result.latest_publication_date == date(2026, 11, 23)
+
+    after_deadline = FixedClock(datetime(2026, 11, 24, 14, 1, tzinfo=UTC))  # Tue 16:01 IL
+    view = await RateQueryService(engine, after_deadline).get_rate("USD", "ILS")
+
+    assert view.observation.source_last_update == datetime(2026, 11, 24, 8, 0, tzinfo=UTC)
+    assert view.observation.publication_date == date(2026, 11, 23)
+    assert view.eligibility.status is EligibilityStatus.NOT_ELIGIBLE
+    assert view.eligibility.reason is EligibilityReason.PUBLICATION_OVERDUE
+    assert view.eligibility.required_publication_date == date(2026, 11, 24)

@@ -7,7 +7,7 @@ usable ``exchangeRates`` array (or a configuration error) rejects everything.
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
@@ -15,15 +15,20 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from rates.domain.calendar import CalendarView, latest_publication_slot, publication_slot
 from rates.domain.decimals import canonical_decimal
-from rates.domain.errors import SnapshotRejected
-from rates.domain.models import BOI_TIMEZONE, CurrencyPair, RateObservation
+from rates.domain.errors import PolicyNotEvaluable, SnapshotRejected
+from rates.domain.models import BOI_TIMEZONE, CurrencyPair, Policy, RateObservation
 
 log = logging.getLogger(__name__)
 
 BOI_QUOTE_CURRENCY = "ILS"
 REASON_MISSING = "missing"
 REASON_DUPLICATE = "duplicate"
+REASON_UNATTRIBUTABLE = (
+    "lastUpdate is outside every BoI publication window and no stored rate exists "
+    "to attribute the restatement to"
+)
 
 _TIMESTAMP = re.compile(
     r"^(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
@@ -127,20 +132,58 @@ def _source_rate(key: str, entry: dict[str, Any]) -> SourceRate:
     return SourceRate(key, rate, unit, parse_last_update(entry.get("lastUpdate")))
 
 
+def attribute_publication_date(
+    last_update: datetime,
+    calendar: CalendarView,
+    policy: Policy,
+    stored: date | None,
+) -> date | None:
+    """The publication date a BoI ``lastUpdate`` stands for (None: cannot tell).
+
+    BoI's API has no date field, and ``lastUpdate`` moves whenever BoI touches an
+    entry, including when it restates an earlier rate. Using its calendar date would
+    turn a morning restatement of yesterday's rate into "today's publication" and
+    make a stale rate ELIGIBLE after today's deadline. So:
+
+    - inside a publication window (business day D, at or after D's expected time):
+      D's publication or a same-day correction -> D;
+    - anywhere else: a restatement of the rate already current, so it keeps the
+      ``stored`` publication date of the pair's current observation (capped at the
+      latest publication slot before ``last_update``);
+    - a restatement with nothing stored -> None (rejected: fail closed).
+
+    Raises ``PolicyNotEvaluable`` if the calendar does not cover the days needed.
+    """
+    slot = publication_slot(last_update, calendar, policy)
+    if slot is not None:
+        return slot
+    if stored is None:
+        return None
+    bound = latest_publication_slot(last_update, calendar, policy)
+    return stored if bound is None else min(stored, bound)
+
+
 def build_ingestion(
     snapshot: Snapshot,
     enabled_pairs: Sequence[CurrencyPair],
     today_local: date,
     retrieved_at: datetime,
+    calendar: CalendarView,
+    policy: Policy,
+    stored_publication_dates: Mapping[tuple[str, str], date] | None = None,
 ) -> IngestionBatch:
     """Validate each enabled currency independently and build its observation.
 
-    Each entry keeps its own ``lastUpdate`` and publication date. A missing,
-    duplicated or invalid entry (bad rate, unit or ``lastUpdate``, or a publication
-    date after ``today_local``) is rejected with a reason; the others are accepted.
+    Each entry keeps its own ``lastUpdate``; its publication date comes from
+    ``attribute_publication_date`` (``stored_publication_dates`` maps
+    ``(base, quote)`` to the publication date of the pair's current observation).
+    A missing, duplicated or invalid entry (bad rate, unit or ``lastUpdate``, a
+    ``lastUpdate`` after ``today_local``, or an unattributable restatement) is
+    rejected with a reason; the others are accepted.
 
-    Raises ``SnapshotRejected`` only for configuration errors: no enabled pairs, or a
-    pair that BoI cannot serve (quote other than ILS).
+    Raises ``SnapshotRejected`` only for configuration errors: no enabled pairs, a
+    pair that BoI cannot serve (quote other than ILS), or a calendar that does not
+    cover the days needed to attribute publication dates.
     """
     if not enabled_pairs:
         raise SnapshotRejected("No enabled currency pairs configured")
@@ -164,14 +207,26 @@ def build_ingestion(
         except SnapshotRejected as exc:
             rejected.append(RejectedCurrency(key, _strip_key(key, str(exc))))
             continue
-        published = publication_date_of(source.last_update)
-        if published > today_local:
+        local_date = publication_date_of(source.last_update)
+        if local_date > today_local:
             rejected.append(
                 RejectedCurrency(
                     key,
-                    f"publication date {published} is after today ({today_local}) in Asia/Jerusalem",
+                    f"publication date {local_date} is after today ({today_local}) in Asia/Jerusalem",
                 )
             )
+            continue
+        try:
+            published = attribute_publication_date(
+                source.last_update,
+                calendar,
+                policy,
+                (stored_publication_dates or {}).get((pair.base, pair.quote)),
+            )
+        except PolicyNotEvaluable as exc:
+            raise SnapshotRejected(f"Cannot attribute publication dates: {exc}") from exc
+        if published is None:
+            rejected.append(RejectedCurrency(key, REASON_UNATTRIBUTABLE))
             continue
         accepted.append(
             RateObservation(

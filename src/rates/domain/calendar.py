@@ -37,8 +37,8 @@ class CalendarView:
         return date(year, 12, 31)
 
 
-def publication_deadline(day: date, policy: Policy) -> datetime:
-    """Expected publication time for ``day`` plus grace, as a UTC instant.
+def expected_publication_time(day: date, policy: Policy) -> datetime:
+    """Expected publication time for ``day`` (no grace), as a UTC instant.
 
     The local wall-clock time is fixed (15:15 Mon-Thu, 12:15 Fri by default), so the
     UTC instant shifts with Israeli daylight-saving time.
@@ -46,8 +46,46 @@ def publication_deadline(day: date, policy: Policy) -> datetime:
     publish_time = (
         policy.friday_publish_time if day.weekday() == FRIDAY else policy.weekday_publish_time
     )
-    local = datetime.combine(day, publish_time, tzinfo=policy.tz)
-    return local.astimezone(UTC) + timedelta(minutes=policy.grace_minutes)
+    return datetime.combine(day, publish_time, tzinfo=policy.tz).astimezone(UTC)
+
+
+def publication_deadline(day: date, policy: Policy) -> datetime:
+    """Expected publication time for ``day`` plus grace, as a UTC instant."""
+    return expected_publication_time(day, policy) + timedelta(minutes=policy.grace_minutes)
+
+
+def publication_slot(last_update: datetime, calendar: CalendarView, policy: Policy) -> date | None:
+    """The business day whose publication a BoI ``lastUpdate`` can be, or None.
+
+    BoI publishes a day's representative rate soon after that day's expected time
+    (15:15 Mon-Thu, 12:15 Fri), so a ``lastUpdate`` is day D's publication (or a
+    same-day correction of it) only if it falls on business day D at or after D's
+    expected time. Any other ``lastUpdate`` (before the expected time, at night, on a
+    weekend or holiday) cannot be a new publication: it is a restatement of an
+    earlier rate, and returning None tells the caller so.
+
+    Raises ``PolicyNotEvaluable`` if the calendar does not cover the day.
+    """
+    day = last_update.astimezone(policy.tz).date()
+    if calendar.is_business_day(day) and expected_publication_time(day, policy) <= last_update:
+        return day
+    return None
+
+
+def latest_publication_slot(
+    last_update: datetime, calendar: CalendarView, policy: Policy
+) -> date | None:
+    """Latest business day whose expected publication time is at or before ``last_update``.
+
+    The most recent publication that a restated ``lastUpdate`` can belong to. Walks
+    back at most ``max_age_days + 1`` days; None if there is no such day.
+    """
+    local_day = last_update.astimezone(policy.tz).date()
+    for offset in range(policy.max_age_days + 1):
+        day = local_day - timedelta(days=offset)
+        if calendar.is_business_day(day) and expected_publication_time(day, policy) <= last_update:
+            return day
+    return None
 
 
 def required_publication_date(

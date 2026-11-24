@@ -12,7 +12,9 @@ from rates.adapters.boi.parser import RejectedCurrency, build_ingestion, parse_p
 from rates.adapters.db.repos import (
     Correction,
     SqlAuditRepository,
+    SqlCalendarRepository,
     SqlPairRepository,
+    SqlPolicyRepository,
     SqlRateRepository,
 )
 from rates.clock import Clock
@@ -69,16 +71,28 @@ class IngestionService:
 
         async with self._engine.begin() as conn:
             pairs = await SqlPairRepository(conn).enabled_pairs()
-            batch = build_ingestion(snapshot, pairs, today_local, retrieved_at)
+            policy = await SqlPolicyRepository(conn).active()
+            if policy is None:
+                raise SnapshotRejected("No active freshness policy: cannot attribute publication dates")
+            calendar = await SqlCalendarRepository(conn).load_view()
+            rates = SqlRateRepository(conn)
+            stored: dict[tuple[str, str], date] = {}
+            for pair in pairs:
+                current = await rates.latest_for_pair(pair.base, pair.quote)
+                if current is not None:
+                    stored[(pair.base, pair.quote)] = current.publication_date
+            batch = build_ingestion(
+                snapshot, pairs, today_local, retrieved_at, calendar, policy, stored
+            )
             if not batch.accepted:
                 raise SnapshotRejected(
                     "No enabled currency is valid: "
                     + "; ".join(f"{r.currency}: {r.reason}" for r in batch.rejected)
                 )
             observations = batch.accepted
-            stored = await SqlRateRepository(conn).store_batch(observations)
-            inserted = stored.inserted
-            for c in stored.corrections:
+            stored_batch = await rates.store_batch(observations)
+            inserted = stored_batch.inserted
+            for c in stored_batch.corrections:
                 log.warning(
                     "rates.same_timestamp_correction pair=%s source_last_update=%s from=%s to=%s "
                     "unit_from=%d unit_to=%d revision=%d",
@@ -122,7 +136,7 @@ class IngestionService:
                                     "new_unit": c.new_unit,
                                     "revision": c.revision,
                                 }
-                                for c in stored.corrections
+                                for c in stored_batch.corrections
                             ],
                             "rejected": [
                                 {"currency": r.currency, "reason": r.reason}
@@ -138,5 +152,5 @@ class IngestionService:
             latest_publication_date=max(o.publication_date for o in observations),
             latest_source_last_update=max(o.source_last_update for o in observations),
             rejected=batch.rejected,
-            corrections=stored.corrections,
+            corrections=stored_batch.corrections,
         )
